@@ -5,9 +5,10 @@ core provides owned server sessions, versioned document handles, source
 projection, typed failures, and portable analysis snapshots. It imports only
 Lean and Std and has **no Lake package dependencies**.
 
-This is an unreleased prototype. The directory currently lives under
-`packages/rosetta/` in verso-blueprint and is the complete unit intended for
-extraction into its own repository. No remote repository or release is assumed.
+Rosetta is developed independently at
+[ejgallego/rosetta](https://github.com/ejgallego/rosetta).
+The API is experimental; pin a commit when consuming it. No compatibility is
+promised between revisions.
 
 | Directory | Lake package | Lean library | Direct package dependencies |
 | --- | --- | --- | --- |
@@ -44,13 +45,17 @@ The client uses stdio transport and UTF-16 LSP positions. Process-group cleanup
 is currently validated on Linux and uses the standard Unix `kill` utility for
 forced termination. Server commands and project configuration are caller-owned.
 
-## Consume locally
+## Use Rosetta
 
-A Lean Lake configuration can depend on this package directly:
+A Lean Lake configuration can pin the standalone repository:
 
 ```lean
-require rosetta from "/path/to/rosetta"
+require rosetta from git "https://github.com/ejgallego/rosetta" @ "<commit>"
 ```
+
+Use an exact commit compatible with your Lean version, then run `lake update
+rosetta`. For local development, replace the Git dependency with
+`require rosetta from "/path/to/rosetta"`.
 
 Then use `import Rosetta`. The main generator operation is
 `Rosetta.analyze : Array ContextProfile → Array Request → EIO ClientError Bundle`.
@@ -67,5 +72,9 @@ conversion to an application's `IO` boundary.
 
 For Verso authoring and rendering, use the separate
 [VersoRosetta package](verso/README.md).
+
+See [migration notes](doc/MIGRATION.md) for consumers of the earlier VBP
+snapshot or the lean-mirror vendored patch, and [contributing](CONTRIBUTING.md)
+for checks and supported toolchains.
 
 The package is licensed under [Apache 2.0](LICENSE).

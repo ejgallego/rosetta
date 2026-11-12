@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [v4.35.0, v4.36.0-rc2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select core toolchain
+        run: echo 'leanprover/lean4:${{ matrix.toolchain }}' > lean-toolchain
+      - uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
+          build: true
+          test: true
+          use-github-cache: false
+  verso:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: verso
+          auto-config: false
+          build: true
+          test: true
+      - name: Check pinned Git consumers and isolation
+        run: python3 tests/check_packages.py
