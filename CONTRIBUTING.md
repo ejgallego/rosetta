@@ -16,6 +16,8 @@ python3 tests/check_packages.py
 ```
 
 The last command builds fresh Git consumers and checks dependency isolation.
+It requires a complete Git checkout; use `git fetch --unshallow` first if the
+repository was cloned with a depth limit. The Verso CI job fetches full history.
 It uses temporary output and does not publish a repository. Real Rust and Rocq
 probes are opt-in; the README gives fixture-based commands. Browser and Blueprint
 rendering acceptance belongs to the consuming VBP project.

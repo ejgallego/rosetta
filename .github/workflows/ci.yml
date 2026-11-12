@@ -30,6 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Lake's local Git consumer fetch needs a complete source repository.
+          fetch-depth: 0
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: verso

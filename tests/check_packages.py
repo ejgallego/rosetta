@@ -12,6 +12,8 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
+    if subprocess.check_output(["git", "rev-parse", "--is-shallow-repository"], cwd=repo, text=True).strip() == "true":
+        raise SystemExit("Package consumer checks need a complete Git checkout; run git fetch --unshallow first.")
     subprocess.run(["git", "diff", "--exit-code", "HEAD"], cwd=repo, check=True)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     bridge_manifest = json.loads((repo / "verso/lake-manifest.json").read_text())
