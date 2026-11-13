@@ -3,7 +3,7 @@ Copyright (c) 2026 Lean FRO LLC. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 Author: Emilio J. Gallego Arias
 -/
-import Rosetta.Workspace
+import Rosetta
 import Rosetta.Client
 import Rosetta.Source
 
@@ -60,6 +60,33 @@ private def pureChecks : IO Unit := do
     check (!(semanticSpans source provider (Json.mkObj [("data", toJson data)])).isOk)
       "invalid semantic token was accepted"
 
+private def bundleChecks : IO Unit := do
+  let request : Request := {
+    key := "body", context := "demo", kind := .code
+    text := "abcd\n", origins := #[⟨"file:///authored", 10, 2⟩, ⟨"file:///authored", 11, 0⟩] }
+  let bundle : Bundle := {
+    requests := #[{ request, languageId := "test", tokens := .ok #[], diagnostics := #[], queries := #[] }]
+    contexts := #[{
+      key := "demo", languageId := "test", diagnosticCoverage := "test"
+      completion := .null, provenance := Json.mkObj [("revision", toJson "caller-owned")], generatedDiagnostics := #[] }] }
+  IO.ofExcept bundle.validate
+  for spans in #[
+      #[{ range := range 0 0 0 3, tokenType := "test", modifiers := #[] },
+        { range := range 0 2 0 4, tokenType := "test", modifiers := #[] }],
+      #[{ range := range 0 1 0 1, tokenType := "test", modifiers := #[] }],
+      #[{ range := range 0 1 1 0, tokenType := "test", modifiers := #[] }],
+      #[{ range := range 0 2 0 4, tokenType := "test", modifiers := #[] },
+        { range := range 0 0 0 2, tokenType := "test", modifiers := #[] }]] do
+    let some initial := bundle.requests[0]? | throw <| IO.userError "missing test snapshot"
+    let saved := { initial with tokens := .ok spans }
+    check (!({ bundle with requests := #[saved] }.validate).isOk)
+      "saved bundle accepted invalid spans rejected by the live contract"
+  check (!({ bundle with formatRevision := 1 }.validate).isOk) "accepted obsolete bundle schema"
+  let replay ← IO.ofExcept <| (fromJson? (toJson bundle) : Except String Bundle)
+  check (toJson replay == toJson bundle) "bundle replay lost caller provenance"
+  let mapped ← IO.ofExcept <| request.authoredLocations (range 0 1 0 3)
+  check (mapped[0]?.any (·.range == range 10 3 10 5)) "authored diagnostic mapping is not derived correctly"
+
 private def awaitNotification (client : Client) (method : String) : IO Unit := do
   let deadline := (← IO.monoMsNow) + 2000
   repeat
@@ -105,7 +132,33 @@ private def cleanupFailureChecks (server : String) : EIO ClientError Unit := do
         let result ← IO.Process.output { cmd := "kill", args := #["-KILL", "--", toString pid] }
         check (result.exitCode == 0) "test-owned escaped descendant was not killed"
 
+private def analysisFailureChecks (server : String) : EIO ClientError Unit := do
+  for mode in #["server-error", "disconnect", "protocol"] do
+    let profile : ContextProfile := {
+      key := "demo", languageId := "test"
+      client := {
+        command := "python3", args := #[server], root := "."
+        initializationOptions := Json.mkObj [("mode", toJson "workspace"), ("tokenMode", toJson mode)] }
+      document := "/tmp/rosetta-analysis.mock"
+      referencePrefix := "", referenceSuffix := ""
+      collectDiagnostics := fun _ => pure { coverage := "mock", diagnostics := #[] } }
+    let request : Request := {
+      key := "body", context := "demo", kind := .code
+      text := "x", origins := #[⟨"authored", 0, 0⟩] }
+    let result ← (analyze #[profile] #[request]).toBaseIO
+    check (match mode, result with
+      | "server-error", .ok bundle => bundle.requests[0]?.any (fun snapshot => snapshot.tokens matches .failed _)
+      | "disconnect", .error .disconnected => true
+      | "protocol", .error (.protocol _) => true
+      | _, _ => false) s!"analysis erased or misclassified {mode}: {repr result.toOption.isSome}"
+
 private def mockChecks (server : String) : EIO ClientError Unit := do
+  let eofClient ← Client.start {
+    command := "python3", args := #[server], root := "."
+    initializationOptions := Json.mkObj [("mode", toJson "wait-eof")] }
+  let eofReport ← eofClient.close
+  check (eofReport.complete && !eofReport.forced)
+    s!"writer retained stdin after exit: {repr eofReport}"
   let mut chattyElapsed := 0
   let client ← Client.start { command := "python3", args := #[server], root := "." }
   try
@@ -474,6 +527,27 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       let deferred ← client.workspaceSymbols "deferred"
       assertCheck (deferred.size == 1 && (deferred[0]?).any (fun symbol => symbol.location.uri == sourceUri))
         "deferred workspace symbol location was not resolved"
+      -- Workspace helpers must prefer an admitted overlay and borrow it.
+      let overlayText := "😀fn measure() { 2 }\r\n"
+      let overlay ← client.openDocument targetUri "test-language" overlayText
+      let overlaid ← client.highlightDefinition "test-language" definition.definition
+      assertCheck (String.join (overlaid.pieces.toList.map HighlightedPiece.text) == "fn measure() { 2 }")
+        "workspace helper ignored the open overlay"
+      assertCheck ((← overlay.text) == overlayText) "workspace helper closed a borrowed document"
+      let borrowed ← client.withDocument targetUri "test-language" overlayText fun document => pure document.version
+      assertCheck (borrowed == overlay.version) "identical overlay was reopened"
+      let mismatch ← (client.withDocument targetUri "test-language" "other" fun _ => pure ()).toBaseIO
+      assertCheck (match mismatch with | .error (.invalidInput _) => true | _ => false)
+        "scoped helper replaced a borrowed overlay"
+      overlay.close
+      client.withDocument targetUri "test-language" overlayText fun _ => pure ()
+      assertCheck ((← client.document? targetUri).isNone) "owned scoped document was not closed"
+      let doubleFailure ← (client.withDocument targetUri "test-language" overlayText fun document => do
+        document.close
+        throw (α := Unit) <| ClientError.invalidInput "action failed").toBaseIO
+      assertCheck (match doubleFailure with
+        | .error (.documentCleanup _ (.staleDocument ..) (some (.invalidInput "action failed"))) => true
+        | _ => false) "document release erased the primary error"
       let clipped ← client.highlightDefinition "test-language" {
         definition.definition with range := { start := ⟨0, 3⟩, «end» := ⟨0, 10⟩ } }
       assertCheck (String.join (clipped.pieces.toList.map HighlightedPiece.text) == "n measu")
@@ -524,13 +598,13 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
             s!"{tokenMode}: token result was mishandled"
         if tokenMode == "range" then
           let document ← client.openDocument targetUri "test-language" "😀fn measure() { 1 }\r\n"
-          let full ← try (document.semanticTokens "😀fn measure() { 1 }\r\n").toBaseIO finally document.close
+          let full ← try (document.semanticTokens).toBaseIO finally document.close
           assertCheck (match full with | .error (.unsupported _) => true | _ => false)
             "range-only server received a full-document request"
     IO.println "Semantic token negotiation, full fallback, null results and readiness passed"
 
 def main (args : List String) : IO Unit := do
   match args with
-  | ["mock", server] => pureChecks; (mockChecks server *> workspaceChecks server).toIO (IO.userError ∘ toString)
+  | ["mock", server] => pureChecks; bundleChecks; (mockChecks server *> analysisFailureChecks server *> workspaceChecks server).toIO (IO.userError ∘ toString)
   | ["probe", language, command, root] => (probe language command root).toIO (IO.userError ∘ toString)
   | _ => throw <| IO.userError "usage: rosetta-spike mock SERVER.py | probe LANGUAGE COMMAND ROOT"

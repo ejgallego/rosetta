@@ -77,17 +77,12 @@ structure AuthoredLocation where
   range : Lsp.Range
 deriving ToJson, FromJson
 
-structure MappedDiagnostic where
-  diagnostic : Lsp.Diagnostic
-  authored : Array AuthoredLocation
-deriving ToJson, FromJson
-
 /-- Facts for one request; source text is owned by `request` once. -/
 structure RequestSnapshot where
   request : Request
   languageId : String
   tokens : Outcome (Array SemanticSpan)
-  diagnostics : Array MappedDiagnostic
+  diagnostics : Array Lsp.Diagnostic
   queries : Array QuerySnapshot
 deriving ToJson, FromJson
 
@@ -97,11 +92,13 @@ structure ContextObservation where
   /-- Names the evidence collected, not a proof/completeness verdict. -/
   diagnosticCoverage : String
   completion : Json
+  /-- Caller-supplied project/server/profile evidence; not freshness validation. -/
+  provenance : Json := .null
   generatedDiagnostics : Array Lsp.Diagnostic
 deriving ToJson, FromJson
 
 structure Bundle where
-  formatRevision : Nat := 1
+  formatRevision : Nat := 2
   requests : Array RequestSnapshot
   contexts : Array ContextObservation
 deriving ToJson, FromJson
@@ -133,7 +130,7 @@ def Request.authoredLocations (request : Request) (range : Lsp.Range) :
 /-- Validate the portable boundary before replay, including unique ownership and
 request-relative ranges. It does not certify the mathematical content. -/
 def Bundle.validate (bundle : Bundle) : Except String Unit := do
-  unless bundle.formatRevision == 1 do throw "unsupported analysis bundle revision"
+  unless bundle.formatRevision == 2 do throw "unsupported analysis bundle revision"
   let mut contextKeys : Std.HashSet String := {}
   for context in bundle.contexts do
     if contextKeys.contains context.key then throw s!"duplicate context: {context.key}"
@@ -147,15 +144,13 @@ def Bundle.validate (bundle : Bundle) : Except String Unit := do
     unless request.origins.size == (request.text.splitOn "\n").length do
       throw s!"invalid authored line map: {request.key}"
     if let .ok tokens := snapshot.tokens then
-      for token in tokens do
-        unless (byteRange? request.text token.range).isSome do throw "invalid saved token range"
+      validateSemanticSpans request.text tokens
     for query in snapshot.queries do
       unless (byteRange? request.text query.range).isSome do throw "invalid saved query range"
       for target in query.localTargets do
         unless bundle.requests.any (fun snapshot => snapshot.request.key == target &&
             snapshot.request.context == request.context) do throw "unknown local definition target"
     for diagnostic in snapshot.diagnostics do
-      let authored ← request.authoredLocations diagnostic.diagnostic.range
-      unless toJson authored == toJson diagnostic.authored do throw "saved diagnostic source map disagrees"
+      discard <| request.authoredLocations diagnostic.range
 
 end Rosetta

@@ -13,14 +13,24 @@ public section
 namespace Rosetta
 open Lean
 
+/-- A reusable line index for strict UTF-16 to UTF-8 conversion. -/
+structure SourceIndex where
+  private lines : Array (Nat × String)
+
+def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
+  let lines := text.splitOn "\n" |>.toArray
+  let mut indexed := #[]
+  let mut base := 0
+  for (line, index) in lines.zipIdx do
+    let content := if index + 1 < lines.size then (line.dropSuffix "\r").copy else line
+    indexed := indexed.push (base, content)
+    base := base + line.utf8ByteSize + 1
+  return { lines := indexed }
+
 /-- Rejects positions beyond a line or inside a UTF-16 surrogate pair.
 CRLF is one line terminator; neither terminator code unit is source content. -/
-def byteOffset? (text : String) (pos : Lsp.Position) : Option Nat := Id.run do
-  let lines := text.splitOn "\n" |>.toArray
-  let some line := lines[pos.line]? | return none
-  let content := if pos.line + 1 < lines.size then
-      (line.dropSuffix "\r").copy else line
-  let base := (lines.extract 0 pos.line).foldl (fun n s => n + s.utf8ByteSize + 1) 0
+def SourceIndex.byteOffset? (index : SourceIndex) (pos : Lsp.Position) : Option Nat := Id.run do
+  let some (base, content) := index.lines[pos.line]? | return none
   let mut col := 0
   let mut offset := base
   for c in content.toList do
@@ -29,11 +39,17 @@ def byteOffset? (text : String) (pos : Lsp.Position) : Option Nat := Id.run do
     offset := offset + c.utf8Size
   return if col == pos.character then some offset else none
 
-def byteRange? (text : String) (range : Lsp.Range) : Option (Nat × Nat) := do
-  let start ← byteOffset? text range.start
-  let stop ← byteOffset? text range.end
+def SourceIndex.byteRange? (index : SourceIndex) (range : Lsp.Range) : Option (Nat × Nat) := do
+  let start ← index.byteOffset? range.start
+  let stop ← index.byteOffset? range.end
   guard (start ≤ stop)
   return (start, stop)
+
+def byteOffset? (text : String) (pos : Lsp.Position) : Option Nat :=
+  (SourceIndex.ofString text).byteOffset? pos
+
+def byteRange? (text : String) (range : Lsp.Range) : Option (Nat × Nat) :=
+  (SourceIndex.ofString text).byteRange? range
 
 structure SourceRange where
   uri : String
@@ -55,6 +71,7 @@ private structure Segment where
 structure Projection where
   text : String
   private segments : Array Segment
+  private index : SourceIndex
 
 def compose (pieces : Array Piece) : Except String Projection := do
   let mut text := ""
@@ -72,7 +89,7 @@ def compose (pieces : Array Piece) : Except String Projection := do
       stop := text.utf8ByteSize + content.utf8ByteSize
       origin? }
     text := text ++ content
-  return { text, segments }
+  return { text, segments, index := SourceIndex.ofString text }
 
 structure MappedRange where
   locations : Array SourceRange := #[]
@@ -82,7 +99,7 @@ structure MappedRange where
 location. Empty ranges belong to the following segment, or the last at EOF. -/
 def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
     Except String MappedRange := do
-  let some (start, stop) := byteRange? projection.text range
+  let some (start, stop) := projection.index.byteRange? range
     | throw "invalid analysis range"
   let pointIndex? := if start == stop then
       projection.segments.findIdx? (fun segment => segment.start ≤ start && start < segment.stop) <|>

@@ -23,4 +23,6 @@ A named reference {lspRef "reference" "foreign" (context := "demo")}[] shares it
     requests.all (·.context == "demo") && requests[0]!.text == "foreign code\n" &&
     requests[1]!.text == "foreign"
 
+#guard requestKey "a:b" "c" != requestKey "a" "b:c"
+
 end VersoRosettaTests

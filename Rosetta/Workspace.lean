@@ -32,8 +32,9 @@ def Document.definitions (document : Document) (position : Lsp.Position) :
   EIO.ofExcept <| (definitionTargets result).mapError ClientError.protocol
 
 /-- Decode the server's semantic token legend against the exact opened text. -/
-def Document.semanticTokens (document : Document) (text : String) (range? : Option Lsp.Range := none) :
+def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := none) :
     EIO ClientError (Array SemanticSpan) := do
+  let text ← document.text
   let caps ← document.client.capabilities
   let some provider := (caps.getObjVal? "semanticTokensProvider").toOption
     | throw <| ClientError.unsupported "semantic tokens"
@@ -67,6 +68,12 @@ private def readSource (uri : String) : EIO ClientError String := do
     | throw <| ClientError.unsupported s!"reading non-file source URI: {uri}"
   IO.FS.readFile file
 
+/-- Use a live overlay when available; only unopened files are read from disk. -/
+private def withSourceDocument (client : Client) (uri languageId : String)
+    (action : Document → EIO ClientError α) : EIO ClientError α := do
+  if let some document ← client.document? uri then return ← action document
+  client.withDocument uri languageId (← readSource uri) action
+
 /-- Find an exact name/container pair among workspace search candidates, then ask
 `definition` at its returned position. Never choose an arbitrary fuzzy match.
 `separator` describes the author's reference syntax, not a server query syntax. -/
@@ -87,9 +94,8 @@ def Client.workspaceDefinition (client : Client) (languageId reference separator
   unless locations.size == 1 do
     throw <| ClientError.invalidInput s!"Expected one workspace symbol for {reference}, found {locations.size}"
   let location := locations[0]!
-  let text ← readSource location.uri
-  let document ← client.openDocument location.uri languageId text
-  let targets ← try document.definitions location.range.start finally document.close
+  let targets ← withSourceDocument client location.uri languageId fun document =>
+    document.definitions location.range.start
   unless targets.size == 1 do
     throw <| ClientError.invalidInput s!"Expected one definition for {reference}, found {targets.size}"
   return targets[0]!
@@ -111,27 +117,28 @@ structure HighlightedDefinition where
 preserves a full definition range; a Location-only server controls its own extent. -/
 def Client.highlightDefinition (client : Client) (languageId : String) (target : DefinitionTarget) :
     EIO ClientError HighlightedDefinition := do
-  let text ← readSource target.uri
-  let some (start, stop) := byteRange? text target.range
-    | throw <| ClientError.protocol "invalid definition range"
-  let document ← client.openDocument target.uri languageId text
-  let spans ← try document.semanticTokens text (some target.range) finally document.close
-  let mut pieces := #[]
-  let mut offset := start
-  for span in spans do
-    let some (left, right) := byteRange? text span.range
-      | throw <| ClientError.protocol "invalid semantic token range"
-    let left := max start left
-    let right := min stop right
-    if left ≥ right then continue
-    if offset < left then
-      pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨left⟩ }
-    pieces := pieces.push {
-      text := String.Pos.Raw.extract text ⟨left⟩ ⟨right⟩
-      tokenType := span.tokenType, modifiers := span.modifiers }
-    offset := right
-  if offset < stop then pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨stop⟩ }
-  return { definition := target, languageId, pieces }
+  withSourceDocument client target.uri languageId fun document => do
+    let text ← document.text
+    let index := SourceIndex.ofString text
+    let some (start, stop) := index.byteRange? target.range
+      | throw <| ClientError.protocol "invalid definition range"
+    let spans ← document.semanticTokens (some target.range)
+    let mut pieces := #[]
+    let mut offset := start
+    for span in spans do
+      let some (left, right) := index.byteRange? span.range
+        | throw <| ClientError.protocol "invalid semantic token range"
+      let left := max start left
+      let right := min stop right
+      if left ≥ right then continue
+      if offset < left then
+        pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨left⟩ }
+      pieces := pieces.push {
+        text := String.Pos.Raw.extract text ⟨left⟩ ⟨right⟩
+        tokenType := span.tokenType, modifiers := span.modifiers }
+      offset := right
+    if offset < stop then pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨stop⟩ }
+    return { definition := target, languageId, pieces }
 
 /-- Resolve an authored workspace reference and highlight its returned definition. -/
 def Client.sourceDefinition (client : Client) (languageId reference separator : String) :

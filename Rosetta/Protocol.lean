@@ -64,6 +64,17 @@ structure SemanticSpan where
   modifiers : Array String
 deriving ToJson, FromJson
 
+/-- The same strict span contract applies to live decoding and saved bundles. -/
+def validateSemanticSpans (source : String) (spans : Array SemanticSpan) : Except String Unit := do
+  let index := SourceIndex.ofString source
+  let mut previousStop := 0
+  for span in spans do
+    unless span.range.start.line == span.range.end.line do throw "multiline semantic token"
+    let some (start, stop) := index.byteRange? span.range | throw "invalid semantic token range"
+    unless start < stop do throw "empty semantic token"
+    unless previousStop ≤ start do throw "overlapping or unordered semantic tokens"
+    previousStop := stop
+
 /-- Decode full, non-overlapping, single-line semantic tokens using the server's
 legend and the exact document. Unknown legend indexes and invalid ranges fail
 explicitly, without changing the underlying source text. -/
@@ -77,7 +88,6 @@ def semanticSpans (source : String) (provider result : Json) :
   unless data.size % 5 == 0 do throw "semantic token data is not a sequence of five-tuples"
   let mut line := 0
   let mut character := 0
-  let mut previousStop := 0
   let mut spans := #[]
   for index in [:data.size / 5] do
     let offset := index * 5
@@ -92,12 +102,10 @@ def semanticSpans (source : String) (provider result : Json) :
     unless mask / 2 ^ modifiers.size == 0 do throw "semantic token has unknown modifier bits"
     let range : Lsp.Range := {
       start := ⟨line, character⟩, «end» := ⟨line, character + length⟩ }
-    let some (start, stop) := byteRange? source range | throw "invalid semantic token range"
-    unless previousStop ≤ start do throw "overlapping semantic tokens"
-    previousStop := stop
     spans := spans.push {
       range, tokenType
       modifiers := (modifiers.zipIdx.filter (fun (_, bit) => mask.testBit bit)).map (·.1) }
+  validateSemanticSpans source spans
   return spans
 
 end Rosetta
