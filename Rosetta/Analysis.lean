@@ -5,7 +5,7 @@ Author: Emilio J. Gallego Arias
 -/
 module
 
-public import Rosetta.Client
+public import Rosetta.Workspace
 public import Rosetta.Document
 
 public section
@@ -30,6 +30,7 @@ structure ContextProfile where
   referencePrefix : String
   referenceSuffix : String
   referenceQueryOffset : String → Nat := fun _ => 0
+  provenance : Json := .null
   collectDiagnostics : Document → EIO ClientError DiagnosticEvidence
 
 private structure Placement where
@@ -59,7 +60,11 @@ private def prepare (profile : ContextProfile) (requests : Array Request) :
 
 private def attempt (action : EIO ClientError α) : EIO ClientError (Outcome α) := do
   try return .ok (← action)
-  catch error => return .failed error.toString
+  catch error =>
+    match error with
+    | .unsupported _ => return .unsupported
+    | .server .. => return .failed error.toString
+    | _ => throw error
 
 private def supports (capabilities : Json) (key : String) : Bool :=
   match capabilities.getObjVal? key with
@@ -94,17 +99,10 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
     let document ← client.openDocument uri profile.languageId projection.text
     let evidence ← profile.collectDiagnostics document
     let caps ← client.capabilities
-    let tokens ← match caps.getObjVal? "semanticTokensProvider" with
-      | .ok provider =>
-        if supports provider "full" then attempt do
-          let raw ← document.request "textDocument/semanticTokens/full" <|
-            Json.mkObj [("textDocument", Json.mkObj [("uri", toJson uri)])]
-          EIO.ofExcept <| (semanticSpans projection.text provider raw).mapError ClientError.protocol
-        else pure .unsupported
-      | .error _ => pure .unsupported
+    let tokens ← attempt document.semanticTokens
     let mut snapshots := #[]
     let mut generatedDiagnostics := #[]
-    let mut mappedDiagnostics : Array (String × MappedDiagnostic) := #[]
+    let mut mappedDiagnostics : Array (String × Lsp.Diagnostic) := #[]
     for diagnostic in evidence.diagnostics do
       let mapped ← EIO.ofExcept <| (projection.mapRange diagnostic.range).mapError ClientError.protocol
       if mapped.containsGenerated || mapped.locations.isEmpty then
@@ -112,9 +110,7 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
       for location in mapped.locations do
         let some request := requests.find? (·.key == location.uri)
           | throw <| ClientError.invalidInput "projection contains an unknown request"
-        mappedDiagnostics := mappedDiagnostics.push (request.key, {
-          diagnostic := { diagnostic with range := location.range }
-          authored := ← EIO.ofExcept <| (request.authoredLocations location.range).mapError ClientError.invalidInput })
+        mappedDiagnostics := mappedDiagnostics.push (request.key, { diagnostic with range := location.range })
     let fileMap := FileMap.ofString projection.text
     for placement in placements do
       let request := placement.request
@@ -153,7 +149,8 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
         diagnostics := (mappedDiagnostics.filter (·.1 == request.key)).map (·.2) }
     return (snapshots, {
       key := profile.key, languageId := profile.languageId,
-      diagnosticCoverage := evidence.coverage, completion := evidence.completion, generatedDiagnostics })
+      diagnosticCoverage := evidence.coverage, completion := evidence.completion,
+      provenance := profile.provenance, generatedDiagnostics })
 
 /-- Analyze a complete plan once at the generator boundary. Duplicate identical
 requests are shared; conflicting identities and unregistered contexts fail.

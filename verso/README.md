@@ -31,5 +31,15 @@ role for Manual documents. `VersoRosetta.collect` gathers inert requests;
 accepted results before ordinary HTML/TeX rendering. Compilation and offline
 enrichment do not start servers.
 
+Logical `(context, key)` identities cannot collide through punctuation. Repeated
+inclusions share snapshots and receive distinct Verso IDs. Definition links use
+Verso's page registry and select the first rendered occurrence, including in
+multi-page output. The renderer remains usable by other genres through explicit
+ID attributes and a local-link resolver.
+
+Saved bundles use revision 2; regenerate older bundles. Replay matches exact
+compiled requests, including authored file URIs, and does not verify external
+project freshness. Profiles may record caller-owned provenance for review.
+
 See the shared [API guide](../doc/API.md). Both packages are covered by the
 repository's [Apache 2.0 license](../LICENSE).

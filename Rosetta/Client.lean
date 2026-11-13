@@ -59,7 +59,7 @@ private structure State where
 
 structure Client where
   private mk ::
-  private child : IO.Process.Child stdio
+  private child : IO.Process.Child { stdio with stdin := .null }
   private state : Std.Mutex State
   private reader : Task (Except ClientError Unit)
   private writer : Task (Except ClientError Unit)
@@ -127,7 +127,7 @@ private partial def writeLoop (input : IO.FS.Stream) (state : Std.Mutex State) :
 
 /-- A partially written frame cannot be cancelled and followed by another frame.
 Retire the transport instead, waking request waiters without taking a pipe lock. -/
-private partial def watchWrites (child : IO.Process.Child stdio) (state : Std.Mutex State) : IO Unit := do
+private partial def watchWrites {cfg : IO.Process.StdioConfig} (child : IO.Process.Child cfg) (state : Std.Mutex State) : IO Unit := do
   repeat
     let now ← IO.monoMsNow
     let (expired, stopped) ← state.atomically do
@@ -377,6 +377,40 @@ def Document.close (document : Document) : EIO ClientError Unit := do
     let s ← enqueue client.config s { payload, deadline }
     set { s with documents := s.documents.erase document.uri }
 
+/-- The exact text belonging to this admitted document version. -/
+def Document.text (document : Document) : EIO ClientError String :=
+  document.client.state.atomically do
+    let s ← get
+    admit s
+    checkDocument s (some (document.uri, document.version))
+    let some doc := s.documents[document.uri]?
+      | throw <| ClientError.staleDocument document.uri document.version none
+    return doc.text
+
+/-- Borrow the currently admitted version, without changing ownership. -/
+def Client.document? (client : Client) (uri : String) : EIO ClientError (Option Document) :=
+  client.state.atomically do
+    let s ← get
+    admit s
+    return s.documents[uri]?.map fun doc => { client, uri, version := doc.version }
+
+/-- Scope an owned document, or borrow an identical already-open version.
+Borrowed handles are never closed. Both action and release failures are retained. -/
+def Client.withDocument (client : Client) (uri languageId text : String)
+    (action : Document → EIO ClientError α) : EIO ClientError α := do
+  if let some document ← client.document? uri then
+    unless (← document.text) == text do
+      throw <| ClientError.invalidInput "cannot replace a borrowed document overlay"
+    return ← action document
+  let document ← client.openDocument uri languageId text
+  let result ← (action document).toBaseIO
+  let released ← document.close.toBaseIO
+  match result, released with
+  | .ok value, .ok () => return value
+  | .error error, .ok () => throw error
+  | .ok _, .error cause => throw <| ClientError.documentCleanup uri cause none
+  | .error error, .error cause => throw <| ClientError.documentCleanup uri cause (some error)
+
 def Document.diagnostics (document : Document) : EIO ClientError (Option DiagnosticSnapshot) :=
   document.client.state.atomically do
     let s ← get
@@ -393,14 +427,17 @@ def Client.latestNotification (client : Client) (method : String) : BaseIO (Opti
 def Client.notifications (client : Client) : BaseIO (Array Json × Nat) :=
   client.state.atomically do return ((← get).notifications, (← get).droppedNotifications)
 
-private def Client.workersStopped (client : Client) : IO Bool := do
-  return (← IO.hasFinished client.reader) && (← IO.hasFinished client.writer) &&
-    (← IO.hasFinished client.stderrReader) && (← IO.hasFinished client.watchdog)
+private def Client.workerStatus (client : Client) : IO WorkerStatus := do
+  return {
+    reader := ← IO.hasFinished client.reader
+    writer := ← IO.hasFinished client.writer
+    stderr := ← IO.hasFinished client.stderrReader
+    watchdog := ← IO.hasFinished client.watchdog }
 
 private def Client.waitWorkers (client : Client) (timeoutMs : Nat) : IO Bool := do
   let deadline := (← IO.monoMsNow) + timeoutMs
   repeat
-    if ← client.workersStopped then return true
+    if (← client.workerStatus).complete then return true
     if (← IO.monoMsNow) ≥ deadline then return false
     IO.sleep 2
   return false
@@ -419,7 +456,7 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
   -- Do not reap the leader while inherited pipes may still be open: its PID
   -- reserves our process-group identity until escalation is complete.
   if ← client.waitWorkers 500 then
-    if (← client.child.tryWait).isSome then return { reaped := true, workersStopped := true }
+    if (← client.child.tryWait).isSome then return { reaped := true, workers := ← client.workerStatus }
   let mut errors := #[]
   try client.child.kill catch error => errors := errors.push error.toString
   discard <| client.waitWorkers 100
@@ -440,11 +477,11 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
           break
         IO.sleep 2
     catch error => errors := errors.push s!"force termination failed: {error}"
-  let workersStopped ← client.waitWorkers 500
+  discard <| client.waitWorkers 500
   -- A delayed signal sender must never retain a PID after we reap its owner.
   unless ← IO.hasFinished client.watchdog do
     return {
-      workersStopped, forced := true
+      workers := ← client.workerStatus, forced := true
       errors := errors.push "termination watchdog still running; child not reaped" }
   let deadline := (← IO.monoMsNow) + 500
   let mut reaped := false
@@ -454,7 +491,7 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
       break
     if (← IO.monoMsNow) ≥ deadline then break
     IO.sleep 2
-  return { reaped, workersStopped, forced := true, errors }
+  return { reaped, workers := ← client.workerStatus, forced := true, errors }
 
 /-- One caller owns cleanup; concurrent and repeated callers share its report.
 Closing rejects new work and invalidates all document handles immediately. -/
@@ -472,10 +509,10 @@ def Client.close (client : Client) : BaseIO CloseReport := do
 def Client.start (config : ClientConfig) : EIO ClientError Client := do
   let root ← IO.FS.realPath config.root
   let config := { config with root }
-  let child ← IO.Process.spawn {
+  let (inputHandle, child) ← (← IO.Process.spawn {
     toStdioConfig := stdio, cmd := config.command, args := config.args,
-    cwd := some config.root, env := config.env, setsid := true }
-  let input := IO.FS.Stream.ofHandle child.stdin
+    cwd := some config.root, env := config.env, setsid := true }).takeStdin
+  let input := IO.FS.Stream.ofHandle inputHandle
   let state ← Std.Mutex.new ({} : State)
   let stderrBytes ← IO.mkRef ByteArray.empty
   let stderrReader ← IO.asTask (drainStderr child.stderr stderrBytes) .dedicated

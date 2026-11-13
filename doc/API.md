@@ -27,6 +27,9 @@ operational errors remain typed through analysis and profile callbacks.
 | `client.notify method params` | Admit a workspace/session notification to the bounded queue |
 | `client.latestNotification method` | Observe retained params for a configured general notification method (`BaseIO`) |
 | `client.openDocument uri languageId text` | Return a handle for the admitted document version |
+| `client.withDocument uri languageId text action` | Own a scoped document, or borrow an identical open overlay without closing it |
+| `client.document? uri` | Borrow the current handle if open |
+| `document.text` | Read the exact text through a current versioned handle |
 | `document.request method params timeoutMs cancel?` | RPC with matching URI/version, checked at admission and delivery |
 | `document.change text` | Admit an edit and return its replacement handle |
 | `document.diagnostics` | Read the snapshot through a current handle |
@@ -53,14 +56,13 @@ retain their existing responsibilities. The current `VersoRosetta.collect` and
 `Client.workspaceSymbols query` wraps `workspace/symbol`, including deferred
 locations via `workspaceSymbol/resolve`. `Document.definitions position` wraps
 `textDocument/definition` and preserves both full and selection ranges from
-LocationLink. `Document.semanticTokens text range?` requests and decodes semantic tokens
+LocationLink. `Document.semanticTokens range?` requests and decodes semantic tokens
 against the exact opened document text. When a range is supplied and the server
 supports range tokens, it requests only that range; otherwise it requests full
 document tokens.
 Rosetta advertises both request forms and never sends an unadvertised full
 request to a range-only server. A `null` token result means no coloring; the
-source slice is still preserved. The `text` argument must be the exact text
-used to open the document version.
+source slice is still preserved. The handle supplies its admitted version's text; callers cannot supply a mismatching buffer.
 
 For a named reference, use:
 
@@ -77,7 +79,12 @@ file URI, and highlights its returned range. The result is a
 `HighlightedDefinition` with the original `DefinitionTarget`, language ID, and
 lossless text pieces carrying semantic token types and modifiers. Token spans
 intersecting the range boundaries are clipped, preserving Unicode and CRLF.
-Source files are read only. Non-file URIs are reported as unsupported.
+An already-open document supplies its overlay and remains open. Otherwise the
+helper reads the file and scopes its temporary document. Non-file URIs without
+an open overlay are reported as unsupported. `withDocument` rejects differing
+text for a borrowed URI. Its callback must retain that admitted version; edits
+or explicit close invalidate the handle and are reported at release. Both action
+and release errors survive as `ClientError.documentCleanup`.
 
 The lower-level operations `Client.workspaceDefinition` and
 `Client.highlightDefinition` can be used separately. Missing or ambiguous names
@@ -142,6 +149,7 @@ paths, or Rust syntax assumptions; the author supplies the reference separator.
 | `protocol detail` | Malformed framing, JSON-RPC, or server feature data |
 | `io cause` | Original `IO.Error`, preserving its constructor and fields |
 | `server code message data?` | A valid server error response; arbitrary integer codes survive |
+| `documentCleanup uri cause original?` | Scoped document release failed, retaining any primary failure |
 | `cleanup report original?` | Incomplete scoped cleanup, retaining any original typed failure |
 
 Absent server error data is `none`; explicit JSON null is `some Json.null`.
@@ -167,12 +175,47 @@ type across concurrent operations. Rendered error wording is diagnostic text,
 not a machine interface. The API remains subject to the project's normal
 no-compatibility policy between revisions.
 
-## Migration from the embedded prototype
+## Analysis, snapshots and rendering
 
-- Replace `.call` with `.request`; existing `.request` users now receive the
-  result directly instead of the envelope.
-- Change client/analysis/profile action signatures to `EIO ClientError` and use
-  constructor matching instead of parsing `IO.Error` text.
-- Replace `document.withClient f` with `f document.client`.
-- Manual cleanup returns `BaseIO CloseReport`; scoped cleanup raises
-  `ClientError.cleanup` if that report is incomplete.
+There are four distinct operations:
+
+- `lspCode` records authored source to analyze in a registered context.
+- `lspRef` queries an expression in that context's composed scope, using the
+  profile's language-specific wrapper. It does not search a workspace index.
+- `workspaceSymbols` / `workspaceDefinition` discover a unique server-reported
+  name/container candidate and follow its definition.
+- `highlightDefinition` presents an existing source range, using an open overlay
+  when available. Its lossless `HighlightedPiece` view serves source excerpts;
+  `SemanticSpan` serves overlays on separately owned authored text.
+
+`analyze` degrades explicit optional-feature server errors into `Outcome.failed`
+and unavailable capabilities into `Outcome.unsupported`. Transport, protocol,
+version, cancellation, deadline, IO and cleanup failures abort with their typed
+`ClientError`; a dead session cannot masquerade as a useful saved analysis.
+
+Bundle revision 2 stores diagnostics only in request coordinates. Authored
+locations are derived by `Request.authoredLocations`, never duplicated in JSON.
+Live semantic tokens and replay share `validateSemanticSpans`: ranges must be
+positive, single-line, ordered, non-overlapping and on valid UTF-16 boundaries.
+`SourceIndex` lets repeated conversions share a precomputed line index.
+
+`ContextProfile.provenance : Json` is caller-owned evidence copied into the
+context observation. It can record project revision, server version and profile
+identity. Rosetta does not verify these values or infer external project freshness.
+Replay matches exact requests, including authored source URIs. Moving the author
+checkout can require recompilation and reanalysis. A JSON-serializable bundle is
+not a location-independent cache or a certificate that dependencies are unchanged.
+
+The Manual bridge uses collision-free `(context, key)` logical identities and
+Verso's occurrence IDs/page registry. Repeated inclusions share analysis but get
+unique HTML IDs; local definition links select the first occurrence in traversal
+order and work across pages. Other genres can supply their own ID attributes and
+`localLink : String → Option String` to the generic renderer. No filesystem links
+are emitted for external targets. Hover text is escaped before entering Verso's
+shared hover table; successful analysis adds no per-block status paragraph.
+
+Session close is bounded. The writer owns stdin exclusively and dropping it
+signals EOF. `CloseReport.workers` records reader, writer, stderr and watchdog
+completion sampled after cleanup; `workersStopped` is computed from those fields.
+Incomplete cleanup remains an error, including escaped descendants retaining
+pipes. See [migration notes](MIGRATION.md) for breaking changes.

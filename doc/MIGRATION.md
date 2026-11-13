@@ -9,8 +9,7 @@ vendored/path dependency; avoid mixing copies of the same package.
 ## Earlier VBP snapshots
 
 The implementation was exported from VBP `bc6c4f5af69ae8c174b93a73e68a781c0e68e073`.
-The exported core and bridge Lean sources are byte-for-byte identical to that
-snapshot. The four commits since the first package extraction retain their
+The initial export preserved the core and bridge Lean sources byte for byte. The four commits since the first package extraction retain their
 history and authorship, with paths relocated to this repository's root.
 Earlier development remains in VBP history. See [origin](ORIGIN.md).
 
@@ -41,3 +40,27 @@ retention before startup; otherwise it returns `ClientError.invalidInput`.
 The generic core contains no Rust-specific status field. Readiness is a
 server-specific observation, not a liveness check or a promise against later
 indexing work. See [API](API.md) for the complete contract.
+
+## Document boundary hardening (bundle revision 2)
+
+Regenerate saved analysis bundles. Revision 1 is rejected: diagnostics no longer
+serialize a second authored-location array, and the Manual bridge encodes logical
+keys as JSON pairs rather than colon-joined strings. There is no legacy decoder.
+
+- Call `document.semanticTokens range?`; remove the formerly required text argument.
+- Read `snapshot.diagnostics` directly as `Array Lsp.Diagnostic`. Use
+  `snapshot.request.authoredLocations diagnostic.range` for authored locations.
+- Supply `ContextProfile.provenance` when project/server/profile evidence matters.
+  It is retained without being interpreted as freshness validation.
+- Use `client.withDocument` for a scoped admitted version and `client.document?`
+  to borrow open overlays. Workspace helpers now preserve existing overlays.
+- `CloseReport.workers` replaces the stored Boolean; `workersStopped` is a derived
+  accessor. Code constructing reports should supply individual worker states.
+- Generic renderer callers supply occurrence ID attributes and a local-link
+  resolver. Manual callers continue through `collect` / `enrich`; Verso owns IDs
+  and paths, including repeated inclusions and multi-page output.
+
+Session-fatal failures now propagate from `analyze` rather than being converted
+to a feature-failure string. Catch typed `ClientError` at the application boundary.
+The earlier prototype's `.call`, `.withClient` and string-parsed IO errors remain
+obsolete; use `.request`, `.client`, and constructor matching.

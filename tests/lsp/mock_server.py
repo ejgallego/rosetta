@@ -53,6 +53,11 @@ while True:
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
+            # These adversarial peers also ignore EOF. The wait-eof peer
+            # deliberately exits here to exercise exclusive stdin ownership.
+            if mode in ("ignore-shutdown", "ignore-term"):
+                while True:
+                    time.sleep(60)
             sys.exit(0)
         if line == b"\r\n":
             break
@@ -110,6 +115,14 @@ while True:
                             "targetSelectionRange": {"start": {"line": 0, "character": 5},
                                                      "end": {"line": 0, "character": 12}}}])
     elif method in ("textDocument/semanticTokens/full", "textDocument/semanticTokens/range"):
+        if token_mode == "disconnect":
+            sys.exit(0)
+        if token_mode == "server-error":
+            send({"id": request_id, "error": {"code": -32601, "message": "feature unavailable"}})
+            continue
+        if token_mode == "protocol":
+            reply(request_id, {"data": [0]})
+            continue
         assert token_mode != "none"
         assert token_mode != "range" or method.endswith("/range")
         assert token_mode != "full" or method.endswith("/full")
@@ -226,5 +239,5 @@ while True:
         if mode not in ("ignore-shutdown", "ignore-term"):
             reply(request_id, None)
     elif method == "exit":
-        if mode not in ("ignore-shutdown", "ignore-term"):
+        if mode not in ("ignore-shutdown", "ignore-term", "wait-eof"):
             sys.exit(0)
