@@ -27,8 +27,9 @@ operational errors remain typed through analysis and profile callbacks.
 | `client.notify method params` | Admit a workspace/session notification to the bounded queue |
 | `client.latestNotification method` | Observe retained params for a configured general notification method (`BaseIO`) |
 | `client.openDocument uri languageId text` | Return a handle for the admitted document version |
-| `client.withDocument uri languageId text action` | Own a scoped document, or borrow an identical open overlay without closing it |
+| `client.withDocument uri languageId text action` | Own a scoped document or borrow an open overlay with matching language and text |
 | `client.document? uri` | Borrow the current handle if open |
+| `document.withBorrowed languageId action text?` | Run a callback on this exact admitted version and keep its overlay open. Optionally require matching text |
 | `document.text` | Read the exact text through a current versioned handle |
 | `document.request method params timeoutMs cancel?` | RPC with matching URI/version, checked at admission and delivery |
 | `document.change text` | Admit an edit and return its replacement handle |
@@ -81,10 +82,11 @@ lossless text pieces carrying semantic token types and modifiers. Token spans
 intersecting the range boundaries are clipped, preserving Unicode and CRLF.
 An already-open document supplies its overlay and remains open. Otherwise the
 helper reads the file and scopes its temporary document. Non-file URIs without
-an open overlay are reported as unsupported. `withDocument` rejects differing
-text for a borrowed URI. Its callback must retain that admitted version; edits
-or explicit close invalidate the handle and are reported at release. Both action
-and release errors survive as `ClientError.documentCleanup`.
+an open overlay are reported as unsupported. Borrowing requires the overlay's
+language ID to match the requested language. `withDocument` also requires
+identical text. Scoped callbacks must retain the admitted version until release.
+An edit or explicit close invalidates that version. `ClientError.documentCleanup`
+reports the release failure and retains any callback error.
 
 The lower-level operations `Client.workspaceDefinition` and
 `Client.highlightDefinition` can be used separately. Missing or ambiguous names
@@ -217,5 +219,7 @@ shared hover table; successful analysis adds no per-block status paragraph.
 Session close is bounded. The writer owns stdin exclusively and dropping it
 signals EOF. `CloseReport.workers` records reader, writer, stderr and watchdog
 completion sampled after cleanup; `workersStopped` is computed from those fields.
-Incomplete cleanup remains an error, including escaped descendants retaining
-pipes. See [migration notes](MIGRATION.md) for breaking changes.
+On Linux, close inspects the owned process group with procfs before reaping its
+leader. Descendants with redirected stdio still require termination. Failed
+inspection or termination produces an incomplete report, as do escaped
+descendants that keep pipes open. See [migration notes](MIGRATION.md).

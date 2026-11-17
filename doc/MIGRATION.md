@@ -64,3 +64,18 @@ Session-fatal failures now propagate from `analyze` rather than being converted
 to a feature-failure string. Catch typed `ClientError` at the application boundary.
 The earlier prototype's `.call`, `.withClient` and string-parsed IO errors remain
 obsolete; use `.request`, `.client`, and constructor matching.
+
+## Scoped documents and Linux session close
+
+Supply the admitted `languageId` when constructing `OpenDocument`. Edits keep
+that language. `withDocument` and workspace source helpers reject borrowing an
+overlay with a different language ID with `ClientError.invalidInput`.
+
+Borrowed scopes validate the version at release and leave the owner's overlay
+in place. An edit or close during the callback produces
+`ClientError.documentCleanup`. A callback error is preserved in `original?`.
+
+On Linux, session close checks the owned process group through readable procfs
+before reaping its leader. Descendants with redirected stdio require
+termination and set `CloseReport.forced`. Inspection and termination errors
+appear in `CloseReport.errors`.

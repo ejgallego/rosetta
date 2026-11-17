@@ -132,6 +132,28 @@ private def cleanupFailureChecks (server : String) : EIO ClientError Unit := do
         let result ← IO.Process.output { cmd := "kill", args := #["-KILL", "--", toString pid] }
         check (result.exitCode == 0) "test-owned escaped descendant was not killed"
 
+/-- Even when all three stdio handles are redirected, the owned descendant
+must be dead before close completes. -/
+private def detachedDescendantChecks (server : String) : EIO ClientError Unit := do
+  unless System.Platform.isLinux do return
+  let client ← Client.start { command := "python3", args := #[server], root := "." }
+  let value ← try
+    client.request "test/detached-descendant" .null
+  catch error =>
+    discard <| client.close
+    throw error
+  let before ← IO.monoMsNow
+  let report ← client.close
+  let pid ← EIO.ofExcept <| (value.getObjValAs? Nat "pid").mapError ClientError.protocol
+  let group ← EIO.ofExcept <| (value.getObjValAs? String "group").mapError ClientError.protocol
+  let started ← EIO.ofExcept <| (value.getObjValAs? String "started").mapError ClientError.protocol
+  check (report.complete && report.forced)
+    s!"leader exit left a descendant with detached stdio: {repr report}"
+  check ((← IO.monoMsNow) - before < 3000) "detached descendant cleanup exceeded its deadline"
+  let result ← IO.Process.output {
+    cmd := "python3", args := #[server, "--check-descendant", toString pid, group, started] }
+  check (result.exitCode == 0) result.stderr
+
 private def analysisFailureChecks (server : String) : EIO ClientError Unit := do
   for mode in #["server-error", "disconnect", "protocol"] do
     let profile : ContextProfile := {
@@ -299,6 +321,7 @@ private def mockChecks (server : String) : EIO ClientError Unit := do
   let inheritedReport ← inherited.close
   check (inheritedReport.complete && inheritedReport.forced)
     s!"leader exit left a descendant holding stdio: {repr inheritedReport}"
+  detachedDescendantChecks server
   let blocked ← Client.start {
     command := "python3", args := #[server], root := ".", timeoutMs := 2000 }
   discard <| blocked.request "test/stop-reading" .null
@@ -527,9 +550,17 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       let deferred ← client.workspaceSymbols "deferred"
       assertCheck (deferred.size == 1 && (deferred[0]?).any (fun symbol => symbol.location.uri == sourceUri))
         "deferred workspace symbol location was not resolved"
+      let indexOverlay ← client.openDocument sourceUri "another-language" "index\n"
+      check (← failsWith (client.workspaceDefinition "test-language" "Container::measure" "::")
+        (fun error => error matches .invalidInput "cannot change a borrowed document language"))
+        "workspace lookup accepted an overlay with a different language"
+      indexOverlay.close
       -- Workspace helpers must prefer an admitted overlay and borrow it.
       let overlayText := "😀fn measure() { 2 }\r\n"
       let overlay ← client.openDocument targetUri "test-language" overlayText
+      check (← failsWith (client.highlightDefinition "another-language" definition.definition)
+        (fun error => error matches .invalidInput "cannot change a borrowed document language"))
+        "source highlighting accepted an overlay with a different language"
       let overlaid ← client.highlightDefinition "test-language" definition.definition
       assertCheck (String.join (overlaid.pieces.toList.map HighlightedPiece.text) == "fn measure() { 2 }")
         "workspace helper ignored the open overlay"
@@ -539,7 +570,26 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       let mismatch ← (client.withDocument targetUri "test-language" "other" fun _ => pure ()).toBaseIO
       assertCheck (match mismatch with | .error (.invalidInput _) => true | _ => false)
         "scoped helper replaced a borrowed overlay"
-      overlay.close
+      check (← failsWith (client.withDocument targetUri "another-language" overlayText fun _ => pure ())
+        (fun error => error matches .invalidInput "cannot change a borrowed document language"))
+        "scoped helper accepted identical text with a different language"
+      client.notify "test/hold-next-token" .null
+      let highlighting ← EIO.asTask (client.highlightDefinition "test-language" definition.definition) .dedicated
+      awaitNotification client "test/held-highlight"
+      let edited ← overlay.change overlayText
+      let stale ← IO.wait highlighting
+      assertCheck (match stale with
+        | .error (.documentCleanup uri (.staleDocument _ expected actual?)
+            (some (.staleDocument ..))) =>
+          uri == targetUri && expected == overlay.version && actual? == some edited.version
+        | _ => false) "workspace highlighting failed to release the stale borrowed version"
+      discard <| client.request "test/release-document" .null
+      check (← failsWith (client.withDocument targetUri "another-language" overlayText fun _ => pure ())
+        (fun error => error matches .invalidInput "cannot change a borrowed document language"))
+        "editing an overlay lost its admitted language"
+      client.withDocument targetUri "test-language" overlayText fun document =>
+        assertCheck (document.version == edited.version) "scoped helper failed to borrow the edited version"
+      edited.close
       client.withDocument targetUri "test-language" overlayText fun _ => pure ()
       assertCheck ((← client.document? targetUri).isNone) "owned scoped document was not closed"
       let doubleFailure ← (client.withDocument targetUri "test-language" overlayText fun document => do
@@ -548,6 +598,32 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       assertCheck (match doubleFailure with
         | .error (.documentCleanup _ (.staleDocument ..) (some (.invalidInput "action failed"))) => true
         | _ => false) "document release erased the primary error"
+      for edit in #[false, true] do
+        for failAction in #[false, true] do
+          let owner ← client.openDocument targetUri "test-language" overlayText
+          let result ← (client.withDocument targetUri "test-language" overlayText fun borrowed => do
+            if edit then discard <| borrowed.change "changed overlay" else borrowed.close
+            if failAction then throw (α := Unit) <| ClientError.invalidInput "borrowed action failed"
+            ).toBaseIO
+          let current? ← client.document? targetUri
+          assertCheck (match result with
+            | .error (.documentCleanup uri (.staleDocument _ expected actual?) original?) =>
+              uri == targetUri && expected == owner.version && actual? == current?.map (·.version) &&
+              (if failAction then original? matches some (.invalidInput "borrowed action failed")
+               else original?.isNone)
+            | _ => false) "borrowed release lost version invalidation or the primary error"
+          if edit then
+            let some current := current? | throw <| ClientError.invalidInput "borrowed release closed owner's overlay"
+            assertCheck ((← current.text) == "changed overlay") "borrowed release changed owner's overlay"
+            current.close
+          else assertCheck current?.isNone "borrowed release reopened a closed document"
+      let owner ← client.openDocument targetUri "test-language" overlayText
+      let failedBorrow ← (client.withDocument targetUri "test-language" overlayText fun _ =>
+        throw (α := Unit) <| ClientError.invalidInput "borrowed action failed").toBaseIO
+      assertCheck (failedBorrow matches .error (.invalidInput "borrowed action failed"))
+        "successful borrowed release changed the primary error"
+      assertCheck ((← owner.text) == overlayText) "borrowed release closed the owner's valid overlay"
+      owner.close
       let clipped ← client.highlightDefinition "test-language" {
         definition.definition with range := { start := ⟨0, 3⟩, «end» := ⟨0, 10⟩ } }
       assertCheck (String.join (clipped.pieces.toList.map HighlightedPiece.text) == "n measu")

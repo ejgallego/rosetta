@@ -46,6 +46,7 @@ structure DiagnosticSnapshot where
 deriving ToJson, FromJson
 
 structure OpenDocument where
+  languageId : String
   version : Int
   text : String := ""
   diagnostics? : Option DiagnosticSnapshot := none

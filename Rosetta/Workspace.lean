@@ -71,7 +71,8 @@ private def readSource (uri : String) : EIO ClientError String := do
 /-- Use a live overlay when available; only unopened files are read from disk. -/
 private def withSourceDocument (client : Client) (uri languageId : String)
     (action : Document → EIO ClientError α) : EIO ClientError α := do
-  if let some document ← client.document? uri then return ← action document
+  if let some document ← client.document? uri then
+    return ← document.withBorrowed languageId action
   client.withDocument uri languageId (← readSource uri) action
 
 /-- Find an exact name/container pair among workspace search candidates, then ask

@@ -92,10 +92,14 @@ private def enqueue (config : ClientConfig) (s : State) (frame : Outbound) : EIO
     throw ClientError.queueFull
   return { s with queue := s.queue.push frame, queuedBytes := s.queuedBytes + frame.payload.utf8ByteSize }
 
+private def checkedDocument (s : State) (uri : String) (version : Int) : EIO ClientError OpenDocument := do
+  let some doc := s.documents[uri]? | throw <| ClientError.staleDocument uri version none
+  unless doc.version == version do throw <| ClientError.staleDocument uri version (some doc.version)
+  return doc
+
 private def checkDocument (s : State) (document? : Option (String × Int)) : EIO ClientError Unit := do
   if let some (uri, expected) := document? then
-    let actual? := s.documents[uri]?.map (·.version)
-    unless actual? == some expected do throw <| ClientError.staleDocument uri expected actual?
+    discard <| checkedDocument s uri expected
 
 private def protocol (value : Except String α) : EIO ClientError α :=
   EIO.ofExcept (value.mapError ClientError.protocol)
@@ -333,7 +337,7 @@ def Client.openDocument (client : Client) (uri languageId text : String) : EIO C
       ("textDocument", Json.mkObj [("uri", toJson uri), ("languageId", toJson languageId),
         ("version", toJson version), ("text", toJson text)])]
     let s ← enqueue client.config s { payload, deadline }
-    set { s with nextVersion := version + 1, documents := s.documents.insert uri { version, text } }
+    set { s with nextVersion := version + 1, documents := s.documents.insert uri { languageId, version, text } }
     return version
   return { client, uri, version }
 
@@ -349,8 +353,7 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
   let version ← client.state.atomically do
     let s ← get
     admit s
-    checkDocument s (some (document.uri, document.version))
-    let some doc := s.documents[document.uri]? | throw <| ClientError.staleDocument document.uri document.version none
+    let doc ← checkedDocument s document.uri document.version
     let version := s.nextVersion
     let change := if kind == some 1 then Json.mkObj [("text", toJson text)] else
       let oldRange : Lsp.Range := {
@@ -361,7 +364,9 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
       ("textDocument", Json.mkObj [("uri", toJson document.uri), ("version", toJson version)]),
       ("contentChanges", toJson #[change])]
     let s ← enqueue client.config s { payload, deadline }
-    set { s with nextVersion := version + 1, documents := s.documents.insert document.uri { version, text } }
+    set { s with
+      nextVersion := version + 1
+      documents := s.documents.insert document.uri { doc with version, text, diagnostics? := none } }
     return version
   return { document with version }
 
@@ -377,15 +382,15 @@ def Document.close (document : Document) : EIO ClientError Unit := do
     let s ← enqueue client.config s { payload, deadline }
     set { s with documents := s.documents.erase document.uri }
 
-/-- The exact text belonging to this admitted document version. -/
-def Document.text (document : Document) : EIO ClientError String :=
+private def Document.snapshot (document : Document) : EIO ClientError OpenDocument :=
   document.client.state.atomically do
     let s ← get
     admit s
-    checkDocument s (some (document.uri, document.version))
-    let some doc := s.documents[document.uri]?
-      | throw <| ClientError.staleDocument document.uri document.version none
-    return doc.text
+    checkedDocument s document.uri document.version
+
+/-- The exact text belonging to this admitted document version. -/
+def Document.text (document : Document) : EIO ClientError String := do
+  return (← document.snapshot).text
 
 /-- Borrow the currently admitted version, without changing ownership. -/
 def Client.document? (client : Client) (uri : String) : EIO ClientError (Option Document) :=
@@ -394,29 +399,38 @@ def Client.document? (client : Client) (uri : String) : EIO ClientError (Option 
     admit s
     return s.documents[uri]?.map fun doc => { client, uri, version := doc.version }
 
-/-- Scope an owned document, or borrow an identical already-open version.
-Borrowed handles are never closed. Both action and release failures are retained. -/
-def Client.withDocument (client : Client) (uri languageId text : String)
+private def Document.withRelease (document : Document) (release : EIO ClientError Unit)
     (action : Document → EIO ClientError α) : EIO ClientError α := do
-  if let some document ← client.document? uri then
-    unless (← document.text) == text do
-      throw <| ClientError.invalidInput "cannot replace a borrowed document overlay"
-    return ← action document
-  let document ← client.openDocument uri languageId text
   let result ← (action document).toBaseIO
-  let released ← document.close.toBaseIO
+  let released ← release.toBaseIO
   match result, released with
   | .ok value, .ok () => return value
   | .error error, .ok () => throw error
-  | .ok _, .error cause => throw <| ClientError.documentCleanup uri cause none
-  | .error error, .error cause => throw <| ClientError.documentCleanup uri cause (some error)
+  | .ok _, .error cause => throw <| ClientError.documentCleanup document.uri cause none
+  | .error error, .error cause => throw <| ClientError.documentCleanup document.uri cause (some error)
 
-def Document.diagnostics (document : Document) : EIO ClientError (Option DiagnosticSnapshot) :=
-  document.client.state.atomically do
-    let s ← get
-    admit s
-    checkDocument s (some (document.uri, document.version))
-    return s.documents[document.uri]? >>= (·.diagnostics?)
+/-- Scope a borrowed handle with the expected language and optional text.
+Release validates the same admitted version and leaves the overlay in place. -/
+def Document.withBorrowed (document : Document) (languageId : String)
+    (action : Document → EIO ClientError α) (text? : Option String := none) : EIO ClientError α := do
+  let doc ← document.snapshot
+  unless doc.languageId == languageId do
+    throw <| ClientError.invalidInput "cannot change a borrowed document language"
+  if text?.any (· != doc.text) then
+    throw <| ClientError.invalidInput "cannot replace a borrowed document overlay"
+  document.withRelease (discard document.snapshot) action
+
+/-- Scope an owned document, or borrow an open overlay with identical language
+and text. Both action and release failures are retained. -/
+def Client.withDocument (client : Client) (uri languageId text : String)
+    (action : Document → EIO ClientError α) : EIO ClientError α := do
+  if let some document ← client.document? uri then
+    return ← document.withBorrowed languageId action (some text)
+  let document ← client.openDocument uri languageId text
+  document.withRelease document.close action
+
+def Document.diagnostics (document : Document) : EIO ClientError (Option DiagnosticSnapshot) := do
+  return (← document.snapshot).diagnostics?
 
 /-- Latest params for a configured general notification method, independent of
 the journal. None means no retained value; some Json.null is a received value.
@@ -442,6 +456,55 @@ private def Client.waitWorkers (client : Client) (timeoutMs : Nat) : IO Bool := 
     IO.sleep 2
   return false
 
+private def processGroupStatus (stat : ByteArray) : IO (Nat × Bool) := do
+  -- The process name may contain parentheses and arbitrary non-UTF-8 bytes.
+  let mut lastParen := none
+  for i in [:stat.size] do
+    if stat[i]! == ')'.toUInt8 then lastParen := some i
+  let some i := lastParen | throw <| IO.userError "invalid proc process status"
+  let some fields := String.fromUTF8? (stat.extract (i + 1) stat.size)
+    | throw <| IO.userError "invalid proc process fields"
+  let fields := (fields.splitOn " ").filter (· != "")
+  let (some status, some group, some threads) :=
+    (fields[0]?, fields[2]?.bind String.toNat?, fields[17]?.bind String.toNat?)
+    | throw <| IO.userError "invalid proc process group status"
+  -- A zombie main thread can still have live siblings.
+  return (group, (status == "Z" || status == "X") && threads ≤ 1)
+
+/-- The unreaped leader reserves the group ID. Before a graceful reap, confirm
+that the leader has exited before taking the proc directory snapshot. Any other
+member or vanished entry could have forked since the snapshot. After SIGKILL,
+check that no live member remains. -/
+private def Client.groupQuiet (client : Client) (deadline : Nat) (graceful : Bool) : IO Bool := do
+  let leader := client.child.pid.toNat
+  if graceful then
+    let (group, exited) ← processGroupStatus (← IO.FS.readBinFile s!"/proc/{leader}/stat")
+    unless group == leader do throw <| IO.userError "child no longer owns its process group"
+    unless exited do return false
+  for entry in ← System.FilePath.readDir "/proc" do
+    let some pid := entry.fileName.toNat? | continue
+    if (← IO.monoMsNow) ≥ deadline then return false
+    let stat? ← try
+      pure <| some (← IO.FS.readBinFile (entry.path / "stat"))
+    catch error =>
+      match error with
+      -- A proc entry can vanish before open (ENOENT) or between open and read (ESRCH).
+      | .noFileOrDirectory .. | .noSuchThing _ 3 _ => pure none
+      | _ => throw error
+    let some stat := stat? | if graceful then return false else continue
+    let (group, exited) ← processGroupStatus stat
+    if group == leader && (!exited || graceful && pid != leader) then
+      return false
+  return true
+
+private def Client.waitGroupQuiet (client : Client) (timeoutMs : Nat) (graceful : Bool) : IO Bool := do
+  let deadline := (← IO.monoMsNow) + timeoutMs
+  repeat
+    if ← client.groupQuiet deadline graceful then return true
+    if (← IO.monoMsNow) ≥ deadline then return false
+    IO.sleep 2
+  return false
+
 private def Client.closeCore (client : Client) : IO CloseReport := do
   let uris ← client.state.atomically do
     let s ← get
@@ -453,32 +516,55 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
   discard <| (client.requestCore "shutdown" .null 500 none none true).toBaseIO
   discard <| (client.notifyCore "exit" .null true).toBaseIO
   client.state.atomically do modify fun s => { s with stopWriter := true }
-  -- Do not reap the leader while inherited pipes may still be open: its PID
-  -- reserves our process-group identity until escalation is complete.
-  if ← client.waitWorkers 500 then
-    if (← client.child.tryWait).isSome then return { reaped := true, workers := ← client.workerStatus }
   let mut errors := #[]
+  -- Descendants can redirect all inherited stdio. On Linux, pipe EOF must be
+  -- followed by a group check before reaping the leader.
+  if ← client.waitWorkers 500 then
+    let groupQuiet ← if System.Platform.isLinux then
+      try client.waitGroupQuiet 100 true
+      catch error => do
+        errors := errors.push s!"process-group inspection failed: {error}"
+        pure false
+    else pure true
+    if groupQuiet then
+      if (← client.child.tryWait).isSome then return { reaped := true, workers := ← client.workerStatus }
   try client.child.kill catch error => errors := errors.push error.toString
   discard <| client.waitWorkers 100
-  -- Lean only exposes SIGTERM on Unix. Invoke the POSIX utility directly,
-  -- without a shell, against the session/process group created by spawn.
-  -- Always escalate before reaping, including when the leader exited first.
+  -- Signal the group explicitly, including when its leader has already exited.
+  let mut helperRunning := false
   if !System.Platform.isWindows then
     try
       let killer ← IO.Process.spawn {
         cmd := "kill", args := #["-KILL", "--", s!"-{client.child.pid}"]
         stdout := .null, stderr := .null }
-      let deadline := (← IO.monoMsNow) + 500
+      helperRunning := true
+      let mut stopping := false
+      let mut deadline := (← IO.monoMsNow) + 500
       repeat
-        if (← killer.tryWait).isSome then break
-        if (← IO.monoMsNow) ≥ deadline then
-          killer.kill
-          errors := errors.push "force-termination helper did not exit"
+        if let some code ← killer.tryWait then
+          helperRunning := false
+          if code != 0 && !stopping then
+            errors := errors.push s!"force-termination helper exited with status {code}"
           break
+        if (← IO.monoMsNow) ≥ deadline then
+          if stopping then break
+          errors := errors.push "force-termination helper did not exit"
+          killer.kill
+          stopping := true
+          deadline ← (· + 100) <$> IO.monoMsNow
         IO.sleep 2
     catch error => errors := errors.push s!"force termination failed: {error}"
+  if System.Platform.isLinux then
+    try
+      unless ← client.waitGroupQuiet 500 false do
+        errors := errors.push "could not confirm the owned process group stopped"
+    catch error => errors := errors.push s!"process-group inspection failed: {error}"
   discard <| client.waitWorkers 500
-  -- A delayed signal sender must never retain a PID after we reap its owner.
+  -- Confirm that every signal sender stopped before releasing the group ID.
+  if helperRunning then
+    return {
+      workers := ← client.workerStatus, forced := true
+      errors := errors.push "termination helper may still be running; child not reaped" }
   unless ← IO.hasFinished client.watchdog do
     return {
       workers := ← client.workerStatus, forced := true

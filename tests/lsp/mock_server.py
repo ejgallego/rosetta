@@ -7,11 +7,28 @@ import sys
 import threading
 import time
 
+
+def process_fields(pid):
+    with open(f"/proc/{pid}/stat", "rb") as status:
+        return status.read().rsplit(b")", 1)[1].decode("ascii").split()
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--check-descendant":
+    try:
+        fields = process_fields(int(sys.argv[2]))
+    except (FileNotFoundError, ProcessLookupError):
+        sys.exit(0)
+    if fields[2] == sys.argv[3] and fields[19] == sys.argv[4] and fields[0] not in ("Z", "X"):
+        raise SystemExit("detached-stdio descendant survived session close")
+    sys.exit(0)
+
+
 write_lock = threading.Lock()
 chatter = {}
 held = None
 client_request = None
 document_request = None
+hold_next_token = False
 cancelled_requests = []
 mode = None
 source_uri = None
@@ -115,6 +132,11 @@ while True:
                             "targetSelectionRange": {"start": {"line": 0, "character": 5},
                                                      "end": {"line": 0, "character": 12}}}])
     elif method in ("textDocument/semanticTokens/full", "textDocument/semanticTokens/range"):
+        if hold_next_token:
+            hold_next_token = False
+            document_request = request_id
+            send({"method": "test/held-highlight", "params": {}})
+            continue
         if token_mode == "disconnect":
             sys.exit(0)
         if token_mode == "server-error":
@@ -156,6 +178,8 @@ while True:
     elif method == "test/hold-document":
         document_request = request_id
         send({"method": "test/held-" + params["tag"], "params": {}})
+    elif method == "test/hold-next-token":
+        hold_next_token = True
     elif method == "test/release-document":
         reply(document_request, "obsolete")
         document_request = None
@@ -168,7 +192,7 @@ while True:
         sys.stderr.write("e" * 200000)
         sys.stderr.flush()
         reply(request_id, True)
-    elif method in ("test/descendant", "test/escaped-descendant"):
+    elif method in ("test/descendant", "test/escaped-descendant", "test/detached-descendant"):
         ready_read, ready_write = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -176,13 +200,27 @@ while True:
             if method == "test/escaped-descendant":
                 os.setsid()
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            if method == "test/detached-descendant":
+                with open("/proc/self/comm", "wb") as comm:
+                    comm.write(b"lsp)child\xff")
+                with open(os.devnull, "r+b", buffering=0) as null:
+                    for fd in (0, 1, 2):
+                        os.dup2(null.fileno(), fd)
             os.write(ready_write, b"r")
             os.close(ready_write)
+            if method == "test/detached-descendant":
+                # Bound the lifetime even when cleanup under test is broken.
+                time.sleep(10)
+                os._exit(0)
             while True:
                 time.sleep(60)
         os.close(ready_write)
         assert os.read(ready_read, 1) == b"r"
         os.close(ready_read)
+        if method == "test/detached-descendant":
+            fields = process_fields(pid)
+            reply(request_id, {"pid": pid, "group": fields[2], "started": fields[19]})
+            continue
         reply(request_id, pid)
         if method == "test/descendant":
             sys.exit(0)
