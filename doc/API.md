@@ -220,6 +220,8 @@ Session close is bounded. The writer owns stdin exclusively and dropping it
 signals EOF. `CloseReport.workers` records reader, writer, stderr and watchdog
 completion sampled after cleanup; `workersStopped` is computed from those fields.
 On Linux, close inspects the owned process group with procfs before reaping its
-leader. Descendants with redirected stdio still require termination. Failed
-inspection or termination produces an incomplete report, as do escaped
-descendants that keep pipes open. See [migration notes](MIGRATION.md).
+leader. Forced close and a stalled in-flight write both send `SIGKILL` to the
+group, including descendants with redirected stdio. Close keeps the group ID
+reserved until any signal sender has stopped. Failed inspection or termination
+produces an incomplete report, as do escaped descendants that keep pipes open.
+See [migration notes](MIGRATION.md).

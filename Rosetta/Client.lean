@@ -56,6 +56,7 @@ private structure State where
   droppedNotifications : Nat := 0
   failure? : Option ClientError := none
   closing : Bool := false
+  writeTerminationRequested : Bool := false
 
 structure Client where
   private mk ::
@@ -63,7 +64,9 @@ structure Client where
   private state : Std.Mutex State
   private reader : Task (Except ClientError Unit)
   private writer : Task (Except ClientError Unit)
-  private watchdog : Task (Except IO.Error Unit)
+  private watchdog : Task Bool
+  private finishWatchdog : IO.Promise Bool
+  private terminationErrors : IO.Ref (Array String)
   private stderrReader : Task (Except IO.Error Unit)
   private stderrBytes : IO.Ref ByteArray
   private initializeResult : IO.Ref Json
@@ -129,25 +132,68 @@ private partial def writeLoop (input : IO.FS.Stream) (state : Std.Mutex State) :
   catch error => state.atomically do
     modify fun s => { (fail s error) with active? := none }
 
+/-- Return whether the termination helper is known to have stopped. The watchdog
+retains the helper while it is live, even if close runs out of time waiting for it. -/
+private def forceTerminate {cfg : IO.Process.StdioConfig} (child : IO.Process.Child cfg)
+    (errors : IO.Ref (Array String)) : BaseIO Bool := do
+  if System.Platform.isWindows then
+    if let .error error ← child.kill.toBaseIO then
+      errors.modify (·.push s!"force termination failed: {error}")
+    return true
+  -- `takeStdin` rebuilds the child handle without the Unix `setsid` flag.
+  let result ← (IO.Process.spawn {
+    cmd := "kill", args := #["-KILL", "--", s!"-{child.pid}"]
+    stdin := .null, stdout := .null, stderr := .null }).toBaseIO
+  let .ok killer := result | do
+    if let .error error := result then errors.modify (·.push s!"force termination failed: {error}")
+    return true
+  let deadline := (← IO.monoMsNow) + 500
+  let mut stopping := false
+  repeat
+    match ← killer.tryWait.toBaseIO with
+    | .ok (some code) =>
+      if code != 0 && !stopping then
+        errors.modify (·.push s!"force-termination helper exited with status {code}")
+      return true
+    | .ok none | .error (.interrupted ..) => pure ()
+    | .error error =>
+      -- Without an exit status we cannot prove the helper has stopped. Do
+      -- not signal its PID or let close release the session's group ID.
+      errors.modify (·.push s!"could not wait for force-termination helper: {error}")
+      return false
+    if !stopping && (← IO.monoMsNow) ≥ deadline then
+      errors.modify (·.push "force-termination helper did not exit")
+      if let .error error ← killer.kill.toBaseIO then
+        errors.modify (·.push s!"could not stop force-termination helper: {error}")
+      stopping := true
+    IO.sleep (if stopping then 50 else 2)
+  return false
+
 /-- A partially written frame cannot be cancelled and followed by another frame.
-Retire the transport instead, waking request waiters without taking a pipe lock. -/
-private partial def watchWrites {cfg : IO.Process.StdioConfig} (child : IO.Process.Child cfg) (state : Std.Mutex State) : IO Unit := do
+The watchdog retires the transport and owns any group signal, including the
+forced-close fallback. `finish` resolves to true when close requires that signal. -/
+private def watchWrites {cfg : IO.Process.StdioConfig} (child : IO.Process.Child cfg)
+    (state : Std.Mutex State) (finish : Task (Option Bool))
+    (errors : IO.Ref (Array String)) : BaseIO Bool := do
   repeat
     let now ← IO.monoMsNow
     let (expired, stopped) ← state.atomically do
       let s ← get
-      -- Cleanup owns termination once closing starts. The tracked watchdog is
-      -- the only other signal sender; close must join it before reaping.
+      -- Closing seals the autonomous signal path before the graceful reap.
       if s.closing then return (false, true)
       if s.active?.any (fun frame => s.failure?.isSome || now ≥ frame.deadline) then
-        set <| fail s (.deadline "write")
+        set { (fail s (.deadline "write")) with writeTerminationRequested := true }
         return (true, false)
       return (false, s.stopWriter && s.active?.isNone)
     if expired then
-      try child.kill catch _ => pure ()
+      unless ← forceTerminate child errors do return false
+      if (← errors.get).isEmpty then return true
+      -- The helper stopped, so close may retry without overlapping signals.
       break
     if stopped then break
     IO.sleep 2
+  if (← IO.wait finish).getD false then return ← forceTerminate child errors
+  return true
 
 private def configurationResult (config : ClientConfig) (params : Json) : Json :=
   let items := (params.getObjValAs? (Array Json) "items").toOption.getD #[]
@@ -454,17 +500,38 @@ def Client.latestNotification (client : Client) (method : String) : BaseIO (Opti
 def Client.notifications (client : Client) : BaseIO (Array Json × Nat) :=
   client.state.atomically do return ((← get).notifications, (← get).droppedNotifications)
 
-private def Client.workerStatus (client : Client) : IO WorkerStatus := do
+private def Client.workerStatus (client : Client) : BaseIO WorkerStatus := do
   return {
     reader := ← IO.hasFinished client.reader
     writer := ← IO.hasFinished client.writer
     stderr := ← IO.hasFinished client.stderrReader
     watchdog := ← IO.hasFinished client.watchdog }
 
-private def Client.waitWorkers (client : Client) (timeoutMs : Nat) : IO Bool := do
+private def waitFor (timeoutMs : Nat) (ready : BaseIO Bool) : BaseIO Bool := do
   let deadline := (← IO.monoMsNow) + timeoutMs
   repeat
-    if (← client.workerStatus).complete then return true
+    if ← ready then return true
+    if (← IO.monoMsNow) ≥ deadline then return false
+    IO.sleep 2
+  return false
+
+private def Client.pipesStopped (client : Client) : BaseIO Bool := do
+  let workers ← client.workerStatus
+  return workers.reader && workers.writer && workers.stderr
+
+private def Client.stopWatchdog (client : Client) : BaseIO Bool := do
+  client.finishWatchdog.resolve false
+  waitFor 100 (IO.hasFinished client.watchdog)
+
+private def Client.reapChild (client : Client) (timeoutMs : Nat) : IO Bool := do
+  let deadline := (← IO.monoMsNow) + timeoutMs
+  repeat
+    try
+      if (← client.child.tryWait).isSome then return true
+    catch error =>
+      match error with
+      | .interrupted .. => if (← IO.monoMsNow) ≥ deadline then throw error
+      | _ => throw error
     if (← IO.monoMsNow) ≥ deadline then return false
     IO.sleep 2
   return false
@@ -530,9 +597,11 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
   discard <| (client.notifyCore "exit" .null true).toBaseIO
   client.state.atomically do modify fun s => { s with stopWriter := true }
   let mut errors := #[]
+  let writeTerminationRequested ← client.state.atomically do return (← get).writeTerminationRequested
   -- Descendants can redirect all inherited stdio. On Linux, pipe EOF must be
   -- followed by a group check before reaping the leader.
-  if ← client.waitWorkers 500 then
+  let pipesStopped ← if writeTerminationRequested then pure false else waitFor 500 client.pipesStopped
+  if pipesStopped then
     let groupQuiet ← if System.Platform.isLinux then
       try client.waitGroupQuiet 100 true
       catch error => do
@@ -540,57 +609,39 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
         pure false
     else pure true
     if groupQuiet then
-      if (← client.child.tryWait).isSome then return { reaped := true, workers := ← client.workerStatus }
-  try client.child.kill catch error => errors := errors.push error.toString
-  discard <| client.waitWorkers 100
-  -- Signal the group explicitly, including when its leader has already exited.
-  let mut helperRunning := false
-  if !System.Platform.isWindows then
-    try
-      let killer ← IO.Process.spawn {
-        cmd := "kill", args := #["-KILL", "--", s!"-{client.child.pid}"]
-        stdout := .null, stderr := .null }
-      helperRunning := true
-      let mut stopping := false
-      let mut deadline := (← IO.monoMsNow) + 500
-      repeat
-        if let some code ← killer.tryWait then
-          helperRunning := false
-          if code != 0 && !stopping then
-            errors := errors.push s!"force-termination helper exited with status {code}"
-          break
-        if (← IO.monoMsNow) ≥ deadline then
-          if stopping then break
-          errors := errors.push "force-termination helper did not exit"
-          killer.kill
-          stopping := true
-          deadline ← (· + 100) <$> IO.monoMsNow
-        IO.sleep 2
-    catch error => errors := errors.push s!"force termination failed: {error}"
+      if System.Platform.isLinux then
+        -- Procfs confirmed the leader's exit. Join the watchdog before reap.
+        unless ← client.stopWatchdog do
+          return {
+            workers := ← client.workerStatus
+            errors := errors.push "termination watchdog did not stop; child not reaped" }
+      match ← (client.reapChild 100).toBaseIO with
+      | .ok false =>
+        if System.Platform.isLinux then
+          return { workers := ← client.workerStatus, errors := errors.push "could not reap exited process-group leader" }
+      | result =>
+        unless System.Platform.isLinux do discard client.stopWatchdog
+        if let .error error := result then errors := errors.push s!"could not reap child: {error}"
+        return { reaped := result.isOk, workers := ← client.workerStatus, errors }
+  client.finishWatchdog.resolve true
+  -- Keep the group ID reserved until its only signal sender and its helper stop.
+  let terminationStopped ← if ← waitFor 600 (IO.hasFinished client.watchdog) then
+    IO.wait client.watchdog
+  else pure false
+  errors := errors ++ (← client.terminationErrors.get)
+  unless terminationStopped do
+    return {
+      workers := ← client.workerStatus, forced := true
+      errors := errors.push "termination may still be in progress; child not reaped" }
   if System.Platform.isLinux then
     try
       unless ← client.waitGroupQuiet 500 false do
         errors := errors.push "could not confirm the owned process group stopped"
     catch error => errors := errors.push s!"process-group inspection failed: {error}"
-  discard <| client.waitWorkers 500
-  -- Confirm that every signal sender stopped before releasing the group ID.
-  if helperRunning then
-    return {
-      workers := ← client.workerStatus, forced := true
-      errors := errors.push "termination helper may still be running; child not reaped" }
-  unless ← IO.hasFinished client.watchdog do
-    return {
-      workers := ← client.workerStatus, forced := true
-      errors := errors.push "termination watchdog still running; child not reaped" }
-  let deadline := (← IO.monoMsNow) + 500
-  let mut reaped := false
-  repeat
-    if (← client.child.tryWait).isSome then
-      reaped := true
-      break
-    if (← IO.monoMsNow) ≥ deadline then break
-    IO.sleep 2
-  return { reaped, workers := ← client.workerStatus, forced := true, errors }
+  discard <| waitFor 500 client.pipesStopped
+  let result ← (client.reapChild 500).toBaseIO
+  if let .error error := result then errors := errors.push s!"could not reap child: {error}"
+  return { reaped := result.toOption.getD false, workers := ← client.workerStatus, forced := true, errors }
 
 /-- One caller owns cleanup; concurrent and repeated callers share its report.
 Closing rejects new work and invalidates all document handles immediately. -/
@@ -618,11 +669,14 @@ def Client.start (config : ClientConfig) : EIO ClientError Client := do
   let reader ← EIO.asTask
     (receiveLoop config (IO.FS.Stream.ofHandle child.stdout) state) .dedicated
   let writer ← EIO.asTask (writeLoop input state) .dedicated
-  let watchdog ← IO.asTask (watchWrites child state) .dedicated
+  let finishWatchdog ← IO.Promise.new
+  let terminationErrors ← IO.mkRef #[]
+  let watchdog ← BaseIO.asTask (watchWrites child state finishWatchdog.result? terminationErrors) .dedicated
   let cleanup ← IO.Promise.new
   let initializeResult ← IO.mkRef Json.null
   let client : Client := {
-    child, state, reader, writer, watchdog, stderrReader, stderrBytes, initializeResult, config, cleanup }
+    child, state, reader, writer, watchdog, finishWatchdog, terminationErrors,
+    stderrReader, stderrBytes, initializeResult, config, cleanup }
   try
     let rootUri := (System.Uri.pathToUri config.root : String)
     let result ← client.request "initialize" <| Json.mkObj [

@@ -14,13 +14,22 @@ def process_fields(pid):
         return status.read().rsplit(b")", 1)[1].decode("ascii").split()
 
 
-if len(sys.argv) > 1 and sys.argv[1] == "--check-descendant":
+def descendant_running(pid, group, started):
     try:
-        fields = process_fields(int(sys.argv[2]))
+        fields = process_fields(pid)
     except (FileNotFoundError, ProcessLookupError):
-        sys.exit(0)
-    if fields[2] == sys.argv[3] and fields[19] == sys.argv[4] and fields[0] not in ("Z", "X"):
-        raise SystemExit("detached-stdio descendant survived session close")
+        return False
+    return fields[2] == group and fields[19] == started and fields[0] not in ("Z", "X")
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--check-descendant":
+    _, _, pid_arg, group, started, timeout_ms = sys.argv
+    pid = int(pid_arg)
+    deadline = time.monotonic() + int(timeout_ms) / 1000
+    while descendant_running(pid, group, started):
+        if time.monotonic() >= deadline:
+            raise SystemExit("detached-stdio descendant is still running")
+        time.sleep(0.01)
     sys.exit(0)
 
 
@@ -212,6 +221,12 @@ while True:
         reply(request_id, True)
     elif method == "test/stop-reading":
         reply(request_id, True)
+        if params == "observe-write":
+            # Acknowledge the next frame as soon as it reaches the pipe, then
+            # leave its oversized body unread so the client writer cannot finish.
+            if not sys.stdin.buffer.read(1):
+                break
+            send({"method": "test/write-started"})
         while True:
             time.sleep(60)
     elif method == "test/stderr":
@@ -236,7 +251,7 @@ while True:
             os.close(ready_write)
             if method == "test/detached-descendant":
                 # Bound the lifetime even when cleanup under test is broken.
-                time.sleep(10)
+                time.sleep(30)
                 os._exit(0)
             while True:
                 time.sleep(60)

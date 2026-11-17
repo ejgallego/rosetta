@@ -132,6 +132,15 @@ private def cleanupFailureChecks (server : String) : EIO ClientError Unit := do
         let result ← IO.Process.output { cmd := "kill", args := #["-KILL", "--", toString pid] }
         check (result.exitCode == 0) "test-owned escaped descendant was not killed"
 
+private def checkDescendantStopped (server : String) (value : Json) (operation : String)
+    (timeoutMs : Nat := 0) : EIO ClientError Unit := do
+  let pid ← EIO.ofExcept <| (value.getObjValAs? Nat "pid").mapError ClientError.protocol
+  let group ← EIO.ofExcept <| (value.getObjValAs? String "group").mapError ClientError.protocol
+  let started ← EIO.ofExcept <| (value.getObjValAs? String "started").mapError ClientError.protocol
+  let result ← IO.Process.output {
+    cmd := "python3", args := #[server, "--check-descendant", toString pid, group, started, toString timeoutMs] }
+  check (result.exitCode == 0) s!"{operation}: {result.stderr}"
+
 /-- Even when all three stdio handles are redirected, the owned descendant
 must be dead before close completes. -/
 private def detachedDescendantChecks (server : String) : EIO ClientError Unit := do
@@ -144,15 +153,35 @@ private def detachedDescendantChecks (server : String) : EIO ClientError Unit :=
     throw error
   let before ← IO.monoMsNow
   let report ← client.close
-  let pid ← EIO.ofExcept <| (value.getObjValAs? Nat "pid").mapError ClientError.protocol
-  let group ← EIO.ofExcept <| (value.getObjValAs? String "group").mapError ClientError.protocol
-  let started ← EIO.ofExcept <| (value.getObjValAs? String "started").mapError ClientError.protocol
   check (report.complete && report.forced)
     s!"leader exit left a descendant with detached stdio: {repr report}"
   check ((← IO.monoMsNow) - before < 3000) "detached descendant cleanup exceeded its deadline"
-  let result ← IO.Process.output {
-    cmd := "python3", args := #[server, "--check-descendant", toString pid, group, started] }
-  check (result.exitCode == 0) result.stderr
+  checkDescendantStopped server value "close after leader exit"
+
+private def stuckWriteDescendantChecks (server large : String) : EIO ClientError Unit := do
+  unless System.Platform.isLinux do return
+  for closeDuringWrite in #[true, false] do
+    let client ← Client.start { command := "python3", args := #[server], root := "." }
+    try
+      let descendant ← client.request "test/detached-descendant" .null
+      discard <| client.request "test/stop-reading" (toJson "observe-write")
+      let pending ← EIO.asTask
+        (client.request "test/blocked" (toJson large) (if closeDuringWrite then 10000 else 3000)) .dedicated
+      awaitNotification client "test/write-started"
+      check (!(← IO.hasFinished pending)) "oversized write finished before the peer stopped reading"
+      if !closeDuringWrite then
+        check ((← IO.wait pending) matches .error (.deadline _)) "stuck write missed its deadline"
+        checkDescendantStopped server descendant "stuck-write watchdog before close" 2000
+      let before ← IO.monoMsNow
+      let report ← client.close
+      check report.complete s!"stuck write left incomplete cleanup: {repr report}"
+      check ((← IO.monoMsNow) - before < 3000) "stuck-write cleanup exceeded its deadline"
+      if closeDuringWrite then
+        check report.forced "close reported graceful cleanup while the write was stuck"
+        checkDescendantStopped server descendant "close during a stuck write"
+        check ((← IO.wait pending) matches .error .closed) "close did not interrupt the stuck write"
+    finally
+      discard <| client.close
 
 private def analysisFailureChecks (server : String) : EIO ClientError Unit := do
   for mode in #["server-error", "disconnect", "protocol"] do
@@ -342,10 +371,11 @@ private def mockChecks (server : String) : EIO ClientError Unit := do
   check (inheritedReport.complete && inheritedReport.forced)
     s!"leader exit left a descendant holding stdio: {repr inheritedReport}"
   detachedDescendantChecks server
+  let large := String.ofList (List.replicate (2 * 1024 * 1024) 'x')
+  stuckWriteDescendantChecks server large
   let blocked ← Client.start {
     command := "python3", args := #[server], root := ".", timeoutMs := 2000 }
   discard <| blocked.request "test/stop-reading" .null
-  let large := String.ofList (List.replicate (2 * 1024 * 1024) 'x')
   -- Encode/queue a notification first, so payload preparation cannot consume
   -- the query's deadline before backpressure has even been exercised.
   blocked.notify "test/blocked" (toJson large)
