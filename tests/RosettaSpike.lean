@@ -183,6 +183,31 @@ private def stuckWriteDescendantChecks (server large : String) : EIO ClientError
     finally
       discard <| client.close
 
+private def localDefinitionChecks (server : String) : EIO ClientError Unit := do
+  let profile : ContextProfile := {
+    key := "demo", languageId := "test"
+    client := {
+      command := "python3", args := #[server], root := "."
+      initializationOptions := Json.mkObj [("mode", toJson "local-definition")] }
+    document := "/tmp/rosetta-analysis.mock"
+    referencePrefix := "", referenceSuffix := ""
+    collectDiagnostics := fun _ => pure { coverage := "mock", diagnostics := #[] } }
+  let declaration : Request := {
+    key := "decl", context := profile.key, kind := .code
+    text := "x", origins := #[⟨"authored", 0, 0⟩] }
+  let exact := { declaration with key := "exact", kind := .reference }
+  let oversized := { exact with key := "oversized" }
+  let bundle ← analyze #[profile] #[declaration, exact, oversized]
+  for (request, endCharacter) in #[(exact, 1), (oversized, 99)] do
+    let snapshot ← IO.ofExcept <| bundle.find request
+    let #[query] := snapshot.queries | check false s!"{request.key}: expected one reference query"
+    let .ok #[target] := query.definitions | check false s!"{request.key}: expected one definition target"
+    check (target.uri == (System.Uri.pathToUri profile.document : String) &&
+      target.range == range 0 0 1 0 && target.selectionRange == range 0 0 0 endCharacter)
+      s!"{request.key}: analysis changed the reported definition target"
+    check (query.localTargets == #["decl"])
+      s!"{request.key}: expected local definition target decl, got {repr query.localTargets}"
+
 private def analysisFailureChecks (server : String) : EIO ClientError Unit := do
   for mode in #["server-error", "disconnect", "protocol"] do
     let profile : ContextProfile := {
@@ -731,6 +756,10 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
 
 def main (args : List String) : IO Unit := do
   match args with
-  | ["mock", server] => pureChecks; bundleChecks; (mockChecks server *> analysisFailureChecks server *> workspaceChecks server).toIO (IO.userError ∘ toString)
+  | ["mock", server] =>
+    pureChecks
+    bundleChecks
+    (localDefinitionChecks server *> mockChecks server *> analysisFailureChecks server *>
+      workspaceChecks server).toIO (IO.userError ∘ toString)
   | ["probe", language, command, root] => (probe language command root).toIO (IO.userError ∘ toString)
   | _ => throw <| IO.userError "usage: rosetta-spike mock SERVER.py | probe LANGUAGE COMMAND ROOT"

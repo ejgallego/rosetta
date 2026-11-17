@@ -195,6 +195,12 @@ and unavailable capabilities into `Outcome.unsupported`. Transport, protocol,
 version, cancellation, deadline, IO and cleanup failures abort with their typed
 `ClientError`; a dead session cannot masquerade as a useful saved analysis.
 
+`QuerySnapshot.definitions` preserves the ranges returned by the prover.
+For a definition in the composed document, `analyze` maps its selection range
+back to the request keys in `localTargets`. The projection recognizes LF and
+CRLF line endings. A UTF-16 column beyond the end of its line resolves to the
+end of that line for this lookup.
+
 Bundle revision 2 stores diagnostics only in request coordinates. Authored
 locations are derived by `Request.authoredLocations`, never duplicated in JSON.
 Live semantic tokens and replay share `validateSemanticSpans`: ranges must be

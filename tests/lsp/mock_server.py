@@ -119,7 +119,7 @@ while True:
         reply(request_id, {"capabilities": {
             "positionEncoding": "utf-8" if mode == "wrong-encoding" else "utf-16",
             "textDocumentSync": 2 if mode == "incremental" else 1,
-            "definitionProvider": True, "hoverProvider": True,
+            "definitionProvider": True, "hoverProvider": mode != "local-definition",
             **({"workspaceSymbolProvider": {"resolveProvider": True},
                 "semanticTokensProvider": {"full": token_mode not in ("range", "none"),
                     "range": token_mode not in ("full", "none"), "legend": {
@@ -146,6 +146,12 @@ while True:
         params["location"]["range"] = {"start": {"line": 0, "character": 0},
                                         "end": {"line": 0, "character": 5}}
         reply(request_id, params)
+    elif method == "textDocument/definition" and mode == "local-definition":
+        end = {1: 1, 2: 99}[params["position"]["line"]]
+        start = {"line": 0, "character": 0}
+        reply(request_id, [{"targetUri": params["textDocument"]["uri"],
+                            "targetRange": {"start": start, "end": {"line": 1, "character": 0}},
+                            "targetSelectionRange": {"start": start, "end": {"line": 0, "character": end}}}])
     elif method == "textDocument/definition":
         reply(request_id, [{"targetUri": target_uri,
                             "targetRange": {"start": {"line": 0, "character": 2},

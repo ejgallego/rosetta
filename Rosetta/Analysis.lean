@@ -86,7 +86,7 @@ private def query (document : Document) (caps : Json) (projection : Projection)
   if let .ok targets := definitions then
     for target in targets do
       if target.uri != uri then continue
-      if let .ok mapped := projection.mapRange target.selectionRange then
+      if let .ok mapped := projection.mapDefinitionRange target.selectionRange then
         for location in mapped.locations do
           unless localTargets.contains location.uri do localTargets := localTargets.push location.uri
   return { range, hover, definitions, localTargets }

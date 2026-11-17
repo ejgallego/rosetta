@@ -27,9 +27,8 @@ def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
     base := base + line.utf8ByteSize + 1
   return { lines := indexed }
 
-/-- Rejects positions beyond a line or inside a UTF-16 surrogate pair.
-CRLF is one line terminator; neither terminator code unit is source content. -/
-def SourceIndex.byteOffset? (index : SourceIndex) (pos : Lsp.Position) : Option Nat := Id.run do
+private def SourceIndex.byteOffsetCore? (index : SourceIndex) (pos : Lsp.Position)
+    (clampColumn : Bool) : Option Nat := Id.run do
   let some (base, content) := index.lines[pos.line]? | return none
   let mut col := 0
   let mut offset := base
@@ -37,13 +36,22 @@ def SourceIndex.byteOffset? (index : SourceIndex) (pos : Lsp.Position) : Option 
     if col == pos.character then return some offset
     col := col + c.utf16Size.toNat
     offset := offset + c.utf8Size
-  return if col == pos.character then some offset else none
+  return if col == pos.character || (clampColumn && col < pos.character) then some offset else none
 
-def SourceIndex.byteRange? (index : SourceIndex) (range : Lsp.Range) : Option (Nat × Nat) := do
-  let start ← index.byteOffset? range.start
-  let stop ← index.byteOffset? range.end
-  guard (start ≤ stop)
+/-- Rejects positions beyond a line or inside a UTF-16 surrogate pair.
+CRLF is one line terminator; neither terminator code unit is source content. -/
+def SourceIndex.byteOffset? (index : SourceIndex) (pos : Lsp.Position) : Option Nat :=
+  index.byteOffsetCore? pos false
+
+private def SourceIndex.byteRangeCore? (index : SourceIndex) (range : Lsp.Range)
+    (clampColumn : Bool) : Option (Nat × Nat) := do
+  guard (compare range.start range.end != .gt)
+  let start ← index.byteOffsetCore? range.start clampColumn
+  let stop ← index.byteOffsetCore? range.end clampColumn
   return (start, stop)
+
+def SourceIndex.byteRange? (index : SourceIndex) (range : Lsp.Range) : Option (Nat × Nat) :=
+  index.byteRangeCore? range false
 
 def byteOffset? (text : String) (pos : Lsp.Position) : Option Nat :=
   (SourceIndex.ofString text).byteOffset? pos
@@ -95,12 +103,8 @@ structure MappedRange where
   locations : Array SourceRange := #[]
   containsGenerated : Bool := false
 
-/-- Split a range at projection boundaries instead of fabricating one source
-location. Empty ranges belong to the following segment, or the last at EOF. -/
-def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
-    Except String MappedRange := do
-  let some (start, stop) := projection.index.byteRange? range
-    | throw "invalid analysis range"
+private def Projection.mapByteRange (projection : Projection) (start stop : Nat) :
+    MappedRange := Id.run do
   let pointIndex? := if start == stop then
       projection.segments.findIdx? (fun segment => segment.start ≤ start && start < segment.stop) <|>
         (if start == projection.text.utf8ByteSize && !projection.segments.isEmpty then
@@ -121,5 +125,21 @@ def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
           «end» := fileMap.utf8PosToLspPos ⟨sourceStart + right - segment.start⟩ }
         result := { result with locations := result.locations.push { origin with range } }
   return result
+
+/-- Split a range at projection boundaries instead of fabricating one source
+location. Empty ranges belong to the following segment, or the last at EOF. -/
+def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
+    Except String MappedRange := do
+  let some (start, stop) := projection.index.byteRange? range
+    | throw "invalid analysis range"
+  return projection.mapByteRange start stop
+
+/-- Project a definition selection range returned for the composed document.
+An oversized UTF-16 column on an existing line denotes the end of that line. -/
+def Projection.mapDefinitionRange (projection : Projection) (range : Lsp.Range) :
+    Except String MappedRange := do
+  let some (start, stop) := projection.index.byteRangeCore? range true
+    | throw "invalid definition selection range"
+  return projection.mapByteRange start stop
 
 end Rosetta
