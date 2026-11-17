@@ -30,5 +30,39 @@ checking process-group shutdown and descendant cleanup there.
 
 There is no compatibility promise between revisions, including documented APIs
 and serialized data. Update affected tests, examples and migration notes with
-API changes. Keep commit subjects in the form `feat: summary`, `fix: summary`,
-`refactor: summary`, etc. Preserve copyright and license notices.
+API changes. Preserve copyright and license notices.
+
+## Pull request descriptions
+
+Use a concise, imperative Lean-style `type: summary` for PR titles and commit
+subjects, such as `feat: support workspace symbol lookup`. Keep the title about
+the change and leave out author or tool prefixes.
+
+Open with a short paragraph beginning "This PR" that explains the problem and
+what callers or maintainers will see after the change. Write it so a reader can
+understand it without following an issue link or opening the diff. A paragraph
+is enough for many PRs.
+
+Add design rationale, caller migration steps, or evidence when they help a
+reviewer assess the change. Link to [migration notes](doc/MIGRATION.md) for
+longer instructions. Leave file inventories and local work notes out. CI
+records routine checks. Mention a regression test, measurement, or manual
+check when its result matters to review, and flag any validation gap that
+affects confidence. Revise the description when review changes the scope or
+behavior so the final text can serve as a squash commit message.
+
+Example title and body for a scoped-document fix
+
+```markdown
+fix: validate borrowed document scopes
+
+This PR makes `Client.withDocument` borrow an open LSP overlay only when its
+language and text match. Previously it could borrow an overlay opened in a
+different language and return success even if the document was edited or
+closed during the callback. It now reports `ClientError.documentCleanup` if
+the borrowed version becomes stale during the callback.
+
+Callers constructing `OpenDocument` records directly must supply `languageId`.
+The mock-server tests cover an overlay edit during source highlighting and
+verify that cleanup preserves the caller's edited overlay.
+```
