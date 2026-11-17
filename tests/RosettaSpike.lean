@@ -174,7 +174,27 @@ private def analysisFailureChecks (server : String) : EIO ClientError Unit := do
       | "protocol", .error (.protocol _) => true
       | _, _ => false) s!"analysis erased or misclassified {mode}: {repr result.toOption.isSome}"
 
+private def incrementalChangeChecks (server : String) : EIO ClientError Unit :=
+  Client.withSession {
+      command := "python3", args := #[server], root := "."
+      initializationOptions := Json.mkObj [("mode", toJson "incremental")] } fun client => do
+    let uri := "file:///incremental"
+    let params := Json.mkObj [("textDocument", Json.mkObj [("uri", toJson uri)])]
+    let initial := "a\rb"
+    let mut document ← client.openDocument uri "test" initial
+    check ((← document.request "test/document-text" params) == toJson initial)
+      "didOpen changed the line endings"
+    for text in #["a\r\nb\rc\n😀", "a\r", "a\r\n", "a\n", "", "😀"] do
+      let oldText ← document.text
+      document ← document.change text
+      let serverText ← document.request "test/document-text" params
+      check (serverText == toJson text)
+        s!"incorrect incremental replacement of {repr oldText}: got {serverText.compress}"
+      check ((← document.text) == text) "didChange changed the caller's text"
+    document.close
+
 private def mockChecks (server : String) : EIO ClientError Unit := do
+  incrementalChangeChecks server
   let eofClient ← Client.start {
     command := "python3", args := #[server], root := "."
     initializationOptions := Json.mkObj [("mode", toJson "wait-eof")] }

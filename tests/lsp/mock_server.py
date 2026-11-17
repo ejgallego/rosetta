@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -34,6 +35,7 @@ mode = None
 source_uri = None
 target_uri = None
 token_mode = None
+documents = {}
 
 
 def send(message):
@@ -63,6 +65,16 @@ def chat(request_id, stopped):
         send({"method": "window/logMessage", "params": {"type": 3, "message": "busy"}})
     # A late response must never answer the next operation.
     reply(request_id, "late")
+
+
+def utf16_offset(text, position):
+    breaks = list(re.finditer(r"\r\n|\r|\n", text))
+    line = position["line"]
+    assert 0 <= line <= len(breaks)
+    start = breaks[line - 1].end() if line else 0
+    end = breaks[line].start() if line < len(breaks) else len(text)
+    prefix = text[start:end].encode("utf-16-le")[:2 * position["character"]]
+    return start + len(prefix.decode("utf-16-le"))
 
 
 while True:
@@ -97,7 +109,7 @@ while True:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         reply(request_id, {"capabilities": {
             "positionEncoding": "utf-8" if mode == "wrong-encoding" else "utf-16",
-            "textDocumentSync": 1,
+            "textDocumentSync": 2 if mode == "incremental" else 1,
             "definitionProvider": True, "hoverProvider": True,
             **({"workspaceSymbolProvider": {"resolveProvider": True},
                 "semanticTokensProvider": {"full": token_mode not in ("range", "none"),
@@ -152,13 +164,27 @@ while True:
             "data": [0, 2, 2, 0, 0, 0, 3, 7, 1, 1, 0, 12, 1, 2, 0]})
     elif method == "textDocument/didOpen":
         document = params["textDocument"]
+        if mode == "incremental":
+            documents[document["uri"]] = document["text"]
         diagnostics(document["uri"], document["version"], "old warning")
         diagnostics(document["uri"], document["version"])
         diagnostics(document["uri"], document["version"] - 1, "stale warning")
     elif method == "textDocument/didChange":
         document = params["textDocument"]
+        if mode == "incremental":
+            uri = document["uri"]
+            text = documents[uri]
+            for change in params["contentChanges"]:
+                start = utf16_offset(text, change["range"]["start"])
+                end = utf16_offset(text, change["range"]["end"])
+                text = text[:start] + change["text"] + text[end:]
+            documents[uri] = text
         diagnostics(document["uri"], 1, "stale after edit")
         diagnostics(document["uri"], document["version"], "current warning")
+    elif method == "textDocument/didClose" and mode == "incremental":
+        del documents[params["textDocument"]["uri"]]
+    elif method == "test/document-text":
+        reply(request_id, documents[params["textDocument"]["uri"]])
     elif method == "test/readiness":
         send({"method": "test/status", "params": {"ready": False}})
         for _ in range(600):
