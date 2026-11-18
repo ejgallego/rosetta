@@ -41,6 +41,7 @@ document_request = None
 hold_next_token = False
 cancelled_requests = []
 mode = None
+shutdown_seen = False
 source_uri = None
 target_uri = None
 token_mode = None
@@ -289,6 +290,7 @@ while True:
                 error["data"] = params["data"]
         send({"id": request_id, "error": error})
     elif method == "test/null":
+        assert "params" in message and params is None, message
         reply(request_id, None)
     elif method == "test/cancellations":
         reply(request_id, cancelled_requests)
@@ -321,8 +323,15 @@ while True:
         sys.stderr.flush()
         sys.exit(7)
     elif method == "shutdown":
+        if mode == "strict-shutdown":
+            assert not shutdown_seen and "params" not in message and request_id is not None, message
+            shutdown_seen = True
+            print("shutdown", file=sys.stderr, flush=True)
         if mode not in ("ignore-shutdown", "ignore-term"):
             reply(request_id, None)
     elif method == "exit":
+        if mode == "strict-shutdown":
+            assert shutdown_seen and "params" not in message and "id" not in message, message
+            print("exit", file=sys.stderr, flush=True)
         if mode not in ("ignore-shutdown", "ignore-term", "wait-eof"):
             sys.exit(0)

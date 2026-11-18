@@ -107,8 +107,9 @@ private def checkDocument (s : State) (document? : Option (String × Int)) : EIO
 private def protocol (value : Except String α) : EIO ClientError α :=
   EIO.ofExcept (value.mapError ClientError.protocol)
 
-private def notification (method : String) (params : Json) : String :=
-  (Json.mkObj [("jsonrpc", "2.0"), ("method", toJson method), ("params", params)]).compress
+private def notification (method : String) (params? : Option Json) : String :=
+  (Json.mkObj ([("jsonrpc", toJson "2.0"), ("method", toJson method)] ++
+    params?.toList.map fun params => ("params", params))).compress
 
 private partial def writeLoop (input : IO.FS.Stream) (state : Std.Mutex State) : EIO ClientError Unit := do
   try
@@ -278,9 +279,9 @@ def Client.capabilities (client : Client) : BaseIO Json := do
 def Client.stderr (client : Client) : BaseIO String := do
   return (String.fromUTF8? (← client.stderrBytes.get)).getD "[stderr contains non-UTF-8 bytes]"
 
-private def Client.notifyCore (client : Client) (method : String) (params : Json)
+private def Client.notifyCore (client : Client) (method : String) (params? : Option Json)
     (internal : Bool := false) : EIO ClientError Unit := do
-  let payload := notification method params
+  let payload := notification method params?
   let deadline := (← IO.monoMsNow) + client.config.timeoutMs
   client.state.atomically do
     let s ← get
@@ -292,11 +293,11 @@ Document lifecycle notifications must use the document operations below. -/
 def Client.notify (client : Client) (method : String) (params : Json) : EIO ClientError Unit := do
   if #["textDocument/didOpen", "textDocument/didChange", "textDocument/didClose"].contains method then
     throw <| ClientError.invalidInput "use document lifecycle operations"
-  client.notifyCore method params
+  client.notifyCore method (some params)
 
 private def Client.cancel (client : Client) (id : Nat) : EIO ClientError Unit := do
   let deadline := (← IO.monoMsNow) + client.config.timeoutMs
-  let payload := notification "$/cancelRequest" (Json.mkObj [("id", toJson id)])
+  let payload := notification "$/cancelRequest" (some (Json.mkObj [("id", toJson id)]))
   client.state.atomically do
     let s ← get
     unless s.pending.contains id do return ()
@@ -315,12 +316,12 @@ private def cancellationRequested (cancel? : Option Std.CancellationToken) : IO 
   | none => pure false
   | some token => token.isCancelled
 
-private def Client.requestCore (client : Client) (method : String) (params : Json)
+private def Client.requestCore (client : Client) (method : String) (params? : Option Json)
     (timeoutMs : Nat) (cancel? : Option Std.CancellationToken)
     (document? : Option (String × Int) := none) (internal : Bool := false) : EIO ClientError Json := do
   let deadline := (← IO.monoMsNow) + timeoutMs
   if ← cancellationRequested cancel? then throw <| ClientError.cancelled method
-  let encodedParams := params.compress
+  let encodedParams? := params?.map Json.compress
   let encodedMethod := (toJson method).compress
   if (← IO.monoMsNow) ≥ deadline then throw <| ClientError.deadline method
   let id ← client.state.atomically do
@@ -330,8 +331,10 @@ private def Client.requestCore (client : Client) (method : String) (params : Jso
     if s.pending.size ≥ client.config.maxPendingRequests then
       throw ClientError.pendingFull
     let id := s.nextId
-    let payload := "{\"jsonrpc\":\"2.0\",\"id\":" ++ toString id ++
-      ",\"method\":" ++ encodedMethod ++ ",\"params\":" ++ encodedParams ++ "}"
+    let header := "{\"jsonrpc\":\"2.0\",\"id\":" ++ toString id ++ ",\"method\":" ++ encodedMethod
+    let payload := (match encodedParams? with
+      | some params => header ++ ",\"params\":" ++ params
+      | none => header) ++ "}"
     let s ← enqueue client.config s { payload, requestId? := some id, deadline }
     set { s with nextId := id + 1, pending := s.pending.insert id none }
     return id
@@ -359,7 +362,7 @@ def Client.request (client : Client) (method : String) (params : Json)
     (timeoutMs : Nat := client.config.timeoutMs) (cancel? : Option Std.CancellationToken := none) : EIO ClientError Json := do
   if (params.getObjVal? "textDocument").isOk then
     throw <| ClientError.invalidInput "document requests require a document handle"
-  client.requestCore method params timeoutMs cancel?
+  client.requestCore method (some params) timeoutMs cancel?
 
 /-- Reject mismatched URIs and stale handles at both admission and delivery.
 The handle itself selects the owning client; it cannot be reused in another one. -/
@@ -370,7 +373,7 @@ def Document.request (document : Document) (method : String) (params : Json)
   if let .ok raw := params.getObjVal? "textDocument" >>= (·.getObjVal? "version") then
     let version ← EIO.ofExcept <| (fromJson? (α := Int) raw).mapError ClientError.invalidInput
     unless version == document.version do throw <| ClientError.invalidInput "request version does not match document handle"
-  document.client.requestCore method params timeoutMs cancel? (some (document.uri, document.version))
+  document.client.requestCore method (some params) timeoutMs cancel? (some (document.uri, document.version))
 
 def Client.openDocument (client : Client) (uri languageId text : String) : EIO ClientError Document := do
   let deadline := (← IO.monoMsNow) + client.config.timeoutMs
@@ -379,7 +382,7 @@ def Client.openDocument (client : Client) (uri languageId text : String) : EIO C
     admit s
     if s.documents.contains uri then throw <| ClientError.invalidInput "document is already open"
     let version := s.nextVersion
-    let payload := notification "textDocument/didOpen" <| Json.mkObj [
+    let payload := notification "textDocument/didOpen" <| some <| Json.mkObj [
       ("textDocument", Json.mkObj [("uri", toJson uri), ("languageId", toJson languageId),
         ("version", toJson version), ("text", toJson text)])]
     let s ← enqueue client.config s { payload, deadline }
@@ -419,7 +422,7 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
     let change := if kind == some 1 then Json.mkObj [("text", toJson text)] else
       let oldRange : Lsp.Range := { start := ⟨0, 0⟩, «end» := documentEndPosition doc.text }
       Json.mkObj [("range", toJson oldRange), ("text", toJson text)]
-    let payload := notification "textDocument/didChange" <| Json.mkObj [
+    let payload := notification "textDocument/didChange" <| some <| Json.mkObj [
       ("textDocument", Json.mkObj [("uri", toJson document.uri), ("version", toJson version)]),
       ("contentChanges", toJson #[change])]
     let s ← enqueue client.config s { payload, deadline }
@@ -432,8 +435,8 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
 def Document.close (document : Document) : EIO ClientError Unit := do
   let client := document.client
   let deadline := (← IO.monoMsNow) + client.config.timeoutMs
-  let payload := notification "textDocument/didClose" (Json.mkObj [
-    ("textDocument", Json.mkObj [("uri", toJson document.uri)])])
+  let payload := notification "textDocument/didClose" <| some <| Json.mkObj [
+    ("textDocument", Json.mkObj [("uri", toJson document.uri)])]
   client.state.atomically do
     let s ← get
     admit s
@@ -591,10 +594,10 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
     set { s with pending := {}, documents := {} }
     return s.documents.toList.map (·.1)
   for uri in uris do
-    discard <| (client.notifyCore "textDocument/didClose" (Json.mkObj [
-      ("textDocument", Json.mkObj [("uri", toJson uri)])]) true).toBaseIO
-  discard <| (client.requestCore "shutdown" .null 500 none none true).toBaseIO
-  discard <| (client.notifyCore "exit" .null true).toBaseIO
+    discard <| (client.notifyCore "textDocument/didClose" (some (Json.mkObj [
+      ("textDocument", Json.mkObj [("uri", toJson uri)])])) true).toBaseIO
+  discard <| (client.requestCore "shutdown" none 500 none none true).toBaseIO
+  discard <| (client.notifyCore "exit" none true).toBaseIO
   client.state.atomically do modify fun s => { s with stopWriter := true }
   let mut errors := #[]
   let writeTerminationRequested ← client.state.atomically do return (← get).writeTerminationRequested

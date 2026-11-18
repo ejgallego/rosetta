@@ -249,6 +249,15 @@ private def incrementalChangeChecks (server : String) : EIO ClientError Unit :=
 
 private def mockChecks (server : String) : EIO ClientError Unit := do
   incrementalChangeChecks server
+  let strictClient ← Client.start {
+    command := "python3", args := #[server], root := "."
+    initializationOptions := Json.mkObj [("mode", "strict-shutdown")] }
+  let strictReport ← strictClient.close
+  let lifecycleTrace ← strictClient.stderr
+  check (lifecycleTrace == "shutdown\nexit\n")
+    s!"mock did not observe shutdown then exit with absent params: {repr lifecycleTrace}"
+  check (strictReport.complete && !strictReport.forced)
+    s!"strict shutdown did not complete gracefully: {repr strictReport}"
   let eofClient ← Client.start {
     command := "python3", args := #[server], root := "."
     initializationOptions := Json.mkObj [("mode", toJson "wait-eof")] }
