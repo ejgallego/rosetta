@@ -10,6 +10,12 @@ permissions:
   contents: read
 
 jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check local maintainer harness
+        run: python3 -m scripts.rosetta_harness validate harness
   core:
     runs-on: ubuntu-latest
     strategy:

@@ -1,5 +1,6 @@
 .lake/
 .beam/
+.worktrees/
 _out/
 __pycache__/
 *.py[cod]
