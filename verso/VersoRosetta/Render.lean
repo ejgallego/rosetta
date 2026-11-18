@@ -10,8 +10,6 @@ import Verso.Doc.TeX
 namespace VersoRosetta
 open Lean Verso Verso.Output Rosetta
 
-def requestAnchor (key : String) : String := s!"verso-rosetta-{hash key}"
-
 def css : String := "
 .hl.lsp { white-space: pre; font-family: monospace; }
 .lsp-panel { margin-block: 1rem; min-width: 0; max-width: 100%; width: 100%; }
@@ -55,11 +53,6 @@ private def tokenClass (kind : String) : String :=
   else if #["string", "number", "regexp"].contains kind then "lsp-literal"
   else if kind == "comment" then "lsp-comment" else "lsp-token"
 
-private def covers (text : String) (range : Lsp.Range) (start stop : Nat) : Bool :=
-  match byteRange? text range with
-  | some (left, right) => left ≤ start && stop ≤ right
-  | none => false
-
 private def hoverContent (query : QuerySnapshot) : Html :=
   let content := match query.hover with
     | .ok (some hover) => Html.tag "pre" #[("class", "lsp-hover-content")] (.text true hover.text)
@@ -76,17 +69,24 @@ private def hoverContent (query : QuerySnapshot) : Html :=
 
 /-- Render source from ranged overlays without encoding foreign identifiers as
 Lean constants. Hover HTML is escaped before entering Verso's shared table. -/
-def sourceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSnapshot) :
+def sourceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSnapshot)
+    (localLink : String → Option String := fun _ => none) :
     Code.HighlightHtmlM g Html := do
   let mut boundaries := #[0, request.text.utf8ByteSize]
   let tokens := snapshot?.map (fun snapshot => match snapshot.tokens with
     | .ok tokens => tokens | _ => #[]) |>.getD #[]
   let queries := snapshot?.map (·.queries) |>.getD #[]
   let diagnostics := snapshot?.map (·.diagnostics) |>.getD #[]
-  let ranges := tokens.map (·.range) ++ queries.map (·.range) ++ diagnostics.map (·.diagnostic.range)
-  for range in ranges do
-    if let some (start, stop) := byteRange? request.text range then
-      boundaries := boundaries.push start |>.push stop
+  let sourceIndex := SourceIndex.ofString request.text
+  -- Convert each overlay exactly once; the sweep below uses only byte ranges.
+  let withBytes := fun (range : Lsp.Range) => sourceIndex.byteRange? range
+  let tokens := tokens.filterMap fun token => (withBytes token.range).map (token, ·)
+  let queries := queries.filterMap fun query => (withBytes query.range).map (query, ·)
+  let diagnostics := diagnostics.filterMap fun diagnostic => (withBytes diagnostic.range).map (diagnostic, ·)
+  for (_, start, stop) in tokens.map (fun (v, r) => (v.range, r)) ++
+      queries.map (fun (v, r) => (v.range, r)) ++ diagnostics.map (fun (v, r) => (v.range, r)) do
+    boundaries := boundaries.push start |>.push stop
+  let covers := fun (left, right) start stop => left ≤ start && stop ≤ right
   let points := (boundaries.qsort (· < ·)).foldl (fun out item =>
     if out.back? == some item then out else out.push item) (#[] : Array Nat)
   let mut out := Html.empty
@@ -94,12 +94,12 @@ def sourceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSn
     let start := points[index]!
     let stop := points[index + 1]!
     let text := String.Pos.Raw.extract request.text ⟨start⟩ ⟨stop⟩
-    let style := (tokens.find? (fun token => covers request.text token.range start stop)).map
-      (fun token => tokenClass token.tokenType) |>.getD "lsp-token"
-    let error := diagnostics.any fun diagnostic =>
-      diagnostic.diagnostic.severity? == some .error && covers request.text diagnostic.diagnostic.range start stop
+    let style := (tokens.find? (fun (_, range) => covers range start stop)).map
+      (fun (token, _) => tokenClass token.tokenType) |>.getD "lsp-token"
+    let error := diagnostics.any fun (diagnostic, range) =>
+      diagnostic.severity? == some .error && covers range start stop
     let mut attrs := #[("class", style ++ if error then " lsp-error" else "")]
-    let query? := queries.find? (fun query => covers request.text query.range start stop)
+    let query? := (queries.find? (fun (_, range) => covers range start stop)).map (·.1)
     if let some query := query? then
       let hoverId ← Code.addHover (g := g) (hoverContent query)
       attrs := attrs ++ #[("data-verso-hover", toString hoverId), ("tabindex", "0")]
@@ -107,8 +107,8 @@ def sourceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSn
     let localTarget? := query?.bind fun query => match query.definitions with
       | .ok targets => if targets.size == 1 && query.localTargets.size == 1 then query.localTargets[0]? else none
       | _ => none
-    let span := match localTarget? with
-      | some target => Html.tag "a" #[("href", "#" ++ requestAnchor target)] span
+    let span := match localTarget? >>= localLink with
+      | some href => Html.tag "a" #[("href", href)] span
       | none => span
     out := out ++ span
   return out
@@ -116,28 +116,29 @@ def sourceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSn
 def diagnosticsHtml (snapshot : RequestSnapshot) : Html :=
   if snapshot.diagnostics.isEmpty then .empty else
     Html.tag "ul" #[("class", "lsp-diagnostics")] <| .seq <| snapshot.diagnostics.map fun diagnostic =>
-      let origin := diagnostic.authored[0]?
+      let origin := (snapshot.request.authoredLocations diagnostic.range).toOption.bind (·[0]?)
       let whereText := origin.map (fun location => s!" (source line {location.range.start.line + 1})") |>.getD ""
-      Html.tag "li" #[] (.text true (diagnostic.diagnostic.message ++ whereText))
+      Html.tag "li" #[] (.text true (diagnostic.message ++ whereText))
 
-def codeHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSnapshot) :
+def codeHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSnapshot)
+    (attrs : Array (String × String) := #[]) (localLink : String → Option String := fun _ => none) :
     Code.HighlightHtmlM g Html := do
   let status := match snapshot? with
     | none => "Not analyzed"
     | some snapshot =>
-      let highlighting := match snapshot.tokens with
-        | .ok _ => ""
-        | .unsupported => " · highlighting unsupported"
-        | .failed _ => " · highlighting failed"
-      s!"Analysis recorded · {snapshot.diagnostics.size} diagnostics{highlighting}"
-  return Html.tag "section" #[("class", "lsp-panel"), ("id", requestAnchor request.key)] <| .seq #[
-    Html.tag "p" #[("class", "lsp-status")] (.text true status),
-    Html.tag "pre" #[] <| Html.tag "code" #[("class", "hl lsp")] (← sourceHtml request snapshot?),
+      match snapshot.tokens with
+      | .ok _ => ""
+      | .unsupported => "Highlighting unsupported"
+      | .failed message => s!"Highlighting failed: {message}"
+  return Html.tag "section" (attrs ++ #[("class", "lsp-panel")]) <| .seq #[
+    if status.isEmpty then .empty else Html.tag "p" #[("class", "lsp-status")] (.text true status),
+    Html.tag "pre" #[] <| Html.tag "code" #[("class", "hl lsp")] (← sourceHtml request snapshot? localLink),
     snapshot?.map diagnosticsHtml |>.getD .empty]
 
-def referenceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSnapshot) :
+def referenceHtml {g : Doc.Genre} (request : Request) (snapshot? : Option RequestSnapshot)
+    (attrs : Array (String × String) := #[]) (localLink : String → Option String := fun _ => none) :
     Code.HighlightHtmlM g Html := do
-  return Html.tag "code" #[("class", "hl lsp lsp-reference"), ("id", requestAnchor request.key)]
-    (← sourceHtml request snapshot?)
+  return Html.tag "code" (attrs ++ #[("class", "hl lsp lsp-reference")])
+    (← sourceHtml request snapshot? localLink)
 
 end VersoRosetta

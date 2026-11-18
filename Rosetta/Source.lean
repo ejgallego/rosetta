@@ -13,27 +13,51 @@ public section
 namespace Rosetta
 open Lean
 
-/-- Rejects positions beyond a line or inside a UTF-16 surrogate pair.
-CRLF is one line terminator; neither terminator code unit is source content. -/
-def byteOffset? (text : String) (pos : Lsp.Position) : Option Nat := Id.run do
+/-- A reusable line index for strict UTF-16 to UTF-8 conversion. -/
+structure SourceIndex where
+  private lines : Array (Nat × String)
+
+def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
   let lines := text.splitOn "\n" |>.toArray
-  let some line := lines[pos.line]? | return none
-  let content := if pos.line + 1 < lines.size then
-      (line.dropSuffix "\r").copy else line
-  let base := (lines.extract 0 pos.line).foldl (fun n s => n + s.utf8ByteSize + 1) 0
+  let mut indexed := #[]
+  let mut base := 0
+  for (line, index) in lines.zipIdx do
+    let content := if index + 1 < lines.size then (line.dropSuffix "\r").copy else line
+    indexed := indexed.push (base, content)
+    base := base + line.utf8ByteSize + 1
+  return { lines := indexed }
+
+private def SourceIndex.byteOffsetCore? (index : SourceIndex) (pos : Lsp.Position)
+    (clampColumn : Bool) : Option Nat := Id.run do
+  let some (base, content) := index.lines[pos.line]? | return none
   let mut col := 0
   let mut offset := base
   for c in content.toList do
     if col == pos.character then return some offset
     col := col + c.utf16Size.toNat
     offset := offset + c.utf8Size
-  return if col == pos.character then some offset else none
+  return if col == pos.character || (clampColumn && col < pos.character) then some offset else none
 
-def byteRange? (text : String) (range : Lsp.Range) : Option (Nat × Nat) := do
-  let start ← byteOffset? text range.start
-  let stop ← byteOffset? text range.end
-  guard (start ≤ stop)
+/-- Rejects positions beyond a line or inside a UTF-16 surrogate pair.
+CRLF is one line terminator; neither terminator code unit is source content. -/
+def SourceIndex.byteOffset? (index : SourceIndex) (pos : Lsp.Position) : Option Nat :=
+  index.byteOffsetCore? pos false
+
+private def SourceIndex.byteRangeCore? (index : SourceIndex) (range : Lsp.Range)
+    (clampColumn : Bool) : Option (Nat × Nat) := do
+  guard (compare range.start range.end != .gt)
+  let start ← index.byteOffsetCore? range.start clampColumn
+  let stop ← index.byteOffsetCore? range.end clampColumn
   return (start, stop)
+
+def SourceIndex.byteRange? (index : SourceIndex) (range : Lsp.Range) : Option (Nat × Nat) :=
+  index.byteRangeCore? range false
+
+def byteOffset? (text : String) (pos : Lsp.Position) : Option Nat :=
+  (SourceIndex.ofString text).byteOffset? pos
+
+def byteRange? (text : String) (range : Lsp.Range) : Option (Nat × Nat) :=
+  (SourceIndex.ofString text).byteRange? range
 
 structure SourceRange where
   uri : String
@@ -55,6 +79,7 @@ private structure Segment where
 structure Projection where
   text : String
   private segments : Array Segment
+  private index : SourceIndex
 
 def compose (pieces : Array Piece) : Except String Projection := do
   let mut text := ""
@@ -72,18 +97,14 @@ def compose (pieces : Array Piece) : Except String Projection := do
       stop := text.utf8ByteSize + content.utf8ByteSize
       origin? }
     text := text ++ content
-  return { text, segments }
+  return { text, segments, index := SourceIndex.ofString text }
 
 structure MappedRange where
   locations : Array SourceRange := #[]
   containsGenerated : Bool := false
 
-/-- Split a range at projection boundaries instead of fabricating one source
-location. Empty ranges belong to the following segment, or the last at EOF. -/
-def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
-    Except String MappedRange := do
-  let some (start, stop) := byteRange? projection.text range
-    | throw "invalid analysis range"
+private def Projection.mapByteRange (projection : Projection) (start stop : Nat) :
+    MappedRange := Id.run do
   let pointIndex? := if start == stop then
       projection.segments.findIdx? (fun segment => segment.start ≤ start && start < segment.stop) <|>
         (if start == projection.text.utf8ByteSize && !projection.segments.isEmpty then
@@ -104,5 +125,21 @@ def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
           «end» := fileMap.utf8PosToLspPos ⟨sourceStart + right - segment.start⟩ }
         result := { result with locations := result.locations.push { origin with range } }
   return result
+
+/-- Split a range at projection boundaries instead of fabricating one source
+location. Empty ranges belong to the following segment, or the last at EOF. -/
+def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
+    Except String MappedRange := do
+  let some (start, stop) := projection.index.byteRange? range
+    | throw "invalid analysis range"
+  return projection.mapByteRange start stop
+
+/-- Project a definition selection range returned for the composed document.
+An oversized UTF-16 column on an existing line denotes the end of that line. -/
+def Projection.mapDefinitionRange (projection : Projection) (range : Lsp.Range) :
+    Except String MappedRange := do
+  let some (start, stop) := projection.index.byteRangeCore? range true
+    | throw "invalid definition selection range"
+  return projection.mapByteRange start stop
 
 end Rosetta

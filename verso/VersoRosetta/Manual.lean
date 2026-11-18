@@ -24,10 +24,30 @@ def Payload.snapshot? : Payload → Option RequestSnapshot
   | .pending _ => none
   | .analyzed snapshot => some snapshot
 
-def requestFromString! (serialized : String) : Request :=
-  match Json.parse serialized >>= fromJson? with
-  | .ok request => request
-  | .error message => panic! s!"invalid compiled LSP request: {message}"
+deriving instance Quote for LineOrigin
+deriving instance Quote for RequestKind
+deriving instance Quote for Request
+
+/-- Logical identity is independent of delimiters and rendered occurrences. -/
+def requestKey (context key : String) : String := (toJson (context, key)).compress
+
+private def requestDomain : Name := ``Rosetta.Request
+
+private def localLink (state : TraverseState) (key : String) : Option String := do
+  let object ← state.getDomainObject? requestDomain key
+  let id ← object.ids.toArray[0]?
+  return (← state.resolveId id).relativeLink
+
+/-- Occurrence IDs belong to Verso; logical targets choose the first occurrence. -/
+private def registerRequest (id : InternalId) (data : Json) : ReaderT TraverseContext (StateT TraverseState (BuildLogT IO)) Unit := do
+  let payload ← match fromJson? (α := Payload) data with
+    | .ok payload => pure payload
+    | .error message => Verso.reportError message; return
+  let path ← (·.path) <$> read
+  discard <| externalTag id path s!"rosetta-{payload.request.key}"
+  modify fun state =>
+    if (state.getDomainObject? requestDomain payload.request.key).isSome then state
+    else state.saveDomainObject requestDomain payload.request.key id
 
 block_extension Block.lspContexts (contexts : Array ContextObservation) where
   data := toJson contexts
@@ -51,13 +71,17 @@ block_extension Block.lspContexts (contexts : Array ContextObservation) where
 
 block_extension Block.lspCode (request : Request) via withHighlighting where
   data := toJson (Payload.pending request)
-  traverse _ _ _ := pure none
+  traverse id data _ := do
+    registerRequest id data
+    pure none
   extraCss := [CSS.mk css]
   extraJs := [JS.mk hoverJs]
-  toHtml := some <| fun _ _ _ data _ => do
+  toHtml := some <| fun _ _ id data _ => do
     match fromJson? (α := Payload) data with
     | .error message => Verso.reportError message *> pure .empty
-    | .ok payload => liftM <| codeHtml (g := Manual) payload.request payload.snapshot?
+    | .ok payload =>
+      let state ← Verso.Doc.Html.HtmlT.state
+      liftM <| codeHtml (g := Manual) payload.request payload.snapshot? (state.htmlId id) (localLink state)
   toTeX := some <| fun _ go _ data _ => do
     match fromJson? (α := Payload) data with
     | .error message => Verso.reportError message *> pure .empty
@@ -67,18 +91,22 @@ block_extension Block.lspCode (request : Request) via withHighlighting where
         | none => pure Verso.Output.TeX.empty
         | some snapshot =>
           go (.para #[.text <| String.intercalate "\n" <|
-            snapshot.diagnostics.toList.map (·.diagnostic.message)])
+            snapshot.diagnostics.toList.map (·.message)])
       return code ++ diagnostics
 
 inline_extension Inline.lspReference (request : Request) via withHighlighting where
   data := toJson (Payload.pending request)
-  traverse _ _ _ := pure none
+  traverse id data _ := do
+    registerRequest id data
+    pure none
   extraCss := [CSS.mk css]
   extraJs := [JS.mk hoverJs]
-  toHtml := some <| fun _ _ data _ => do
+  toHtml := some <| fun _ id data _ => do
     match fromJson? (α := Payload) data with
     | .error message => Verso.reportError message *> pure .empty
-    | .ok payload => liftM <| referenceHtml (g := Manual) payload.request payload.snapshot?
+    | .ok payload =>
+      let state ← Verso.Doc.Html.HtmlT.state
+      liftM <| referenceHtml (g := Manual) payload.request payload.snapshot? (state.htmlId id) (localLink state)
   toTeX := some <| fun go _ data _ => do
     match fromJson? (α := Payload) data with
     | .error message => Verso.reportError message *> pure .empty
@@ -129,10 +157,9 @@ private def codeOrigins (contents : StrLit) : DocElabM (Array LineOrigin) := do
 def lspCode : CodeBlockExpanderOf CodeConfig
   | config, contents => do
     let request : Request := {
-      key := config.context ++ ":" ++ config.key, context := config.context
+      key := requestKey config.context config.key, context := config.context
       kind := .code, text := contents.getString, origins := ← codeOrigins contents }
-    let serialized := (toJson request).compress
-    ``(Block.other (Block.lspCode (requestFromString! $(quote serialized))) #[])
+    ``(Block.other (Block.lspCode $(quote request)) #[])
 
 /-- Named references are compiled as inert requests in an explicitly named scope. -/
 @[role]
@@ -148,12 +175,11 @@ def lspRef : RoleExpanderOf ReferenceConfig
       throwError "escaped reference literals are not supported by this experimental source mapper"
     let position := fileMap.utf8PosToLspPos (range.start + '"')
     let request : Request := {
-      key := config.context ++ ":" ++ config.key, context := config.context
+      key := requestKey config.context config.key, context := config.context
       kind := .reference, text
       origins := #[{ uri := (System.Uri.pathToUri (← getFileName) : String),
                      line := position.line, character := position.character }] }
-    let serialized := (toJson request).compress
-    ``(Inline.other (Inline.lspReference (requestFromString! $(quote serialized))) #[])
+    ``(Inline.other (Inline.lspReference $(quote request)) #[])
 
 /-- Transform extension children as well as ordinary blocks. Other extensions'
 opaque JSON is left alone; nested document data requires its own explicit hook. -/

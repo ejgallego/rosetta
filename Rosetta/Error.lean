@@ -12,14 +12,27 @@ public section
 namespace Rosetta
 open Lean
 
+/-- Completion of the independently owned session workers. -/
+structure WorkerStatus where
+  reader : Bool := false
+  writer : Bool := false
+  stderr : Bool := false
+  watchdog : Bool := false
+  deriving Inhabited, Repr
+
+def WorkerStatus.complete (status : WorkerStatus) : Bool :=
+  status.reader && status.writer && status.stderr && status.watchdog
+
 /-- Cleanup succeeds only when the child is reaped and every IO worker stops.
 An incomplete report is retained for repeated/concurrent close callers. -/
 structure CloseReport where
   reaped : Bool := false
-  workersStopped : Bool := false
+  workers : WorkerStatus := {}
   forced : Bool := false
   errors : Array String := #[]
   deriving Inhabited, Repr
+
+def CloseReport.workersStopped (report : CloseReport) : Bool := report.workers.complete
 
 def CloseReport.complete (report : CloseReport) : Bool :=
   report.reaped && report.workersStopped && report.errors.isEmpty
@@ -40,6 +53,7 @@ inductive ClientError where
   | protocol (detail : String)
   | io (cause : IO.Error)
   | server (code : Int) (message : String) (data? : Option Json)
+  | documentCleanup (uri : String) (cause : ClientError) (original? : Option ClientError)
   | cleanup (report : CloseReport) (original? : Option ClientError)
 
 partial def ClientError.toString : ClientError → String
@@ -57,6 +71,9 @@ partial def ClientError.toString : ClientError → String
     | .io cause => cause.toString
     | .server code message data? =>
       s!"server error {code}: {message}" ++ (data?.map (fun data => s!" ({data.compress})") |>.getD "")
+    | .documentCleanup uri cause original? =>
+      let detail := s!"document cleanup failed for {uri}: {ClientError.toString cause}"
+      original?.map (fun original => s!"{ClientError.toString original}; {detail}") |>.getD detail
     | .cleanup report original? =>
       let cleanup := s!"session cleanup incomplete: {repr report}"
       original?.map (fun original => s!"{ClientError.toString original}; {cleanup}") |>.getD cleanup

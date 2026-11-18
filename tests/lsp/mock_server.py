@@ -2,21 +2,49 @@
 
 import json
 import os
+import re
 import signal
 import sys
 import threading
 import time
+
+
+def process_fields(pid):
+    with open(f"/proc/{pid}/stat", "rb") as status:
+        return status.read().rsplit(b")", 1)[1].decode("ascii").split()
+
+
+def descendant_running(pid, group, started):
+    try:
+        fields = process_fields(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return fields[2] == group and fields[19] == started and fields[0] not in ("Z", "X")
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--check-descendant":
+    _, _, pid_arg, group, started, timeout_ms = sys.argv
+    pid = int(pid_arg)
+    deadline = time.monotonic() + int(timeout_ms) / 1000
+    while descendant_running(pid, group, started):
+        if time.monotonic() >= deadline:
+            raise SystemExit("detached-stdio descendant is still running")
+        time.sleep(0.01)
+    sys.exit(0)
+
 
 write_lock = threading.Lock()
 chatter = {}
 held = None
 client_request = None
 document_request = None
+hold_next_token = False
 cancelled_requests = []
 mode = None
 source_uri = None
 target_uri = None
 token_mode = None
+documents = {}
 
 
 def send(message):
@@ -48,11 +76,26 @@ def chat(request_id, stopped):
     reply(request_id, "late")
 
 
+def utf16_offset(text, position):
+    breaks = list(re.finditer(r"\r\n|\r|\n", text))
+    line = position["line"]
+    assert 0 <= line <= len(breaks)
+    start = breaks[line - 1].end() if line else 0
+    end = breaks[line].start() if line < len(breaks) else len(text)
+    prefix = text[start:end].encode("utf-16-le")[:2 * position["character"]]
+    return start + len(prefix.decode("utf-16-le"))
+
+
 while True:
     headers = {}
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
+            # These adversarial peers also ignore EOF. The wait-eof peer
+            # deliberately exits here to exercise exclusive stdin ownership.
+            if mode in ("ignore-shutdown", "ignore-term"):
+                while True:
+                    time.sleep(60)
             sys.exit(0)
         if line == b"\r\n":
             break
@@ -75,8 +118,8 @@ while True:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         reply(request_id, {"capabilities": {
             "positionEncoding": "utf-8" if mode == "wrong-encoding" else "utf-16",
-            "textDocumentSync": 1,
-            "definitionProvider": True, "hoverProvider": True,
+            "textDocumentSync": 2 if mode == "incremental" else 1,
+            "definitionProvider": True, "hoverProvider": mode != "local-definition",
             **({"workspaceSymbolProvider": {"resolveProvider": True},
                 "semanticTokensProvider": {"full": token_mode not in ("range", "none"),
                     "range": token_mode not in ("full", "none"), "legend": {
@@ -103,6 +146,12 @@ while True:
         params["location"]["range"] = {"start": {"line": 0, "character": 0},
                                         "end": {"line": 0, "character": 5}}
         reply(request_id, params)
+    elif method == "textDocument/definition" and mode == "local-definition":
+        end = {1: 1, 2: 99}[params["position"]["line"]]
+        start = {"line": 0, "character": 0}
+        reply(request_id, [{"targetUri": params["textDocument"]["uri"],
+                            "targetRange": {"start": start, "end": {"line": 1, "character": 0}},
+                            "targetSelectionRange": {"start": start, "end": {"line": 0, "character": end}}}])
     elif method == "textDocument/definition":
         reply(request_id, [{"targetUri": target_uri,
                             "targetRange": {"start": {"line": 0, "character": 2},
@@ -110,6 +159,19 @@ while True:
                             "targetSelectionRange": {"start": {"line": 0, "character": 5},
                                                      "end": {"line": 0, "character": 12}}}])
     elif method in ("textDocument/semanticTokens/full", "textDocument/semanticTokens/range"):
+        if hold_next_token:
+            hold_next_token = False
+            document_request = request_id
+            send({"method": "test/held-highlight", "params": {}})
+            continue
+        if token_mode == "disconnect":
+            sys.exit(0)
+        if token_mode == "server-error":
+            send({"id": request_id, "error": {"code": -32601, "message": "feature unavailable"}})
+            continue
+        if token_mode == "protocol":
+            reply(request_id, {"data": [0]})
+            continue
         assert token_mode != "none"
         assert token_mode != "range" or method.endswith("/range")
         assert token_mode != "full" or method.endswith("/full")
@@ -117,13 +179,27 @@ while True:
             "data": [0, 2, 2, 0, 0, 0, 3, 7, 1, 1, 0, 12, 1, 2, 0]})
     elif method == "textDocument/didOpen":
         document = params["textDocument"]
+        if mode == "incremental":
+            documents[document["uri"]] = document["text"]
         diagnostics(document["uri"], document["version"], "old warning")
         diagnostics(document["uri"], document["version"])
         diagnostics(document["uri"], document["version"] - 1, "stale warning")
     elif method == "textDocument/didChange":
         document = params["textDocument"]
+        if mode == "incremental":
+            uri = document["uri"]
+            text = documents[uri]
+            for change in params["contentChanges"]:
+                start = utf16_offset(text, change["range"]["start"])
+                end = utf16_offset(text, change["range"]["end"])
+                text = text[:start] + change["text"] + text[end:]
+            documents[uri] = text
         diagnostics(document["uri"], 1, "stale after edit")
         diagnostics(document["uri"], document["version"], "current warning")
+    elif method == "textDocument/didClose" and mode == "incremental":
+        del documents[params["textDocument"]["uri"]]
+    elif method == "test/document-text":
+        reply(request_id, documents[params["textDocument"]["uri"]])
     elif method == "test/readiness":
         send({"method": "test/status", "params": {"ready": False}})
         for _ in range(600):
@@ -143,19 +219,27 @@ while True:
     elif method == "test/hold-document":
         document_request = request_id
         send({"method": "test/held-" + params["tag"], "params": {}})
+    elif method == "test/hold-next-token":
+        hold_next_token = True
     elif method == "test/release-document":
         reply(document_request, "obsolete")
         document_request = None
         reply(request_id, True)
     elif method == "test/stop-reading":
         reply(request_id, True)
+        if params == "observe-write":
+            # Acknowledge the next frame as soon as it reaches the pipe, then
+            # leave its oversized body unread so the client writer cannot finish.
+            if not sys.stdin.buffer.read(1):
+                break
+            send({"method": "test/write-started"})
         while True:
             time.sleep(60)
     elif method == "test/stderr":
         sys.stderr.write("e" * 200000)
         sys.stderr.flush()
         reply(request_id, True)
-    elif method in ("test/descendant", "test/escaped-descendant"):
+    elif method in ("test/descendant", "test/escaped-descendant", "test/detached-descendant"):
         ready_read, ready_write = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -163,13 +247,27 @@ while True:
             if method == "test/escaped-descendant":
                 os.setsid()
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            if method == "test/detached-descendant":
+                with open("/proc/self/comm", "wb") as comm:
+                    comm.write(b"lsp)child\xff")
+                with open(os.devnull, "r+b", buffering=0) as null:
+                    for fd in (0, 1, 2):
+                        os.dup2(null.fileno(), fd)
             os.write(ready_write, b"r")
             os.close(ready_write)
+            if method == "test/detached-descendant":
+                # Bound the lifetime even when cleanup under test is broken.
+                time.sleep(30)
+                os._exit(0)
             while True:
                 time.sleep(60)
         os.close(ready_write)
         assert os.read(ready_read, 1) == b"r"
         os.close(ready_read)
+        if method == "test/detached-descendant":
+            fields = process_fields(pid)
+            reply(request_id, {"pid": pid, "group": fields[2], "started": fields[19]})
+            continue
         reply(request_id, pid)
         if method == "test/descendant":
             sys.exit(0)
@@ -226,5 +324,5 @@ while True:
         if mode not in ("ignore-shutdown", "ignore-term"):
             reply(request_id, None)
     elif method == "exit":
-        if mode not in ("ignore-shutdown", "ignore-term"):
+        if mode not in ("ignore-shutdown", "ignore-term", "wait-eof"):
             sys.exit(0)
