@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# == 0 )); then
+  echo 'Usage: scripts/lean-low-priority COMMAND [ARG...]' >&2
+  exit 2
+fi
+
+niceness="${ROSETTA_LEAN_NICENESS:-10}"
+if [[ ! "$niceness" =~ ^([0-9]|1[0-9])$ ]]; then
+  echo 'ROSETTA_LEAN_NICENESS must be an integer between 0 and 19' >&2
+  exit 2
+fi
+if command -v nice >/dev/null 2>&1; then
+  exec nice -n "$niceness" "$@"
+else
+  exec "$@"
+fi
