@@ -107,9 +107,18 @@ private def checkDocument (s : State) (document? : Option (String × Int)) : EIO
 private def protocol (value : Except String α) : EIO ClientError α :=
   EIO.ofExcept (value.mapError ClientError.protocol)
 
+private def serializeCall (message : Option Json.Structured → JsonRpc.Message)
+    (params? : Option Json) : String :=
+  let json := match params? with
+    | none => toJson (message none)
+    | some (.arr items) => toJson (message (some (.arr items)))
+    | some (.obj fields) => toJson (message (some (.obj fields)))
+    -- The public client API also accepts explicit null and scalar params.
+    | some params => (toJson (message none)).setObjVal! "params" params
+  json.compress
+
 private def notification (method : String) (params? : Option Json) : String :=
-  (Json.mkObj ([("jsonrpc", toJson "2.0"), ("method", toJson method)] ++
-    params?.toList.map fun params => ("params", params))).compress
+  serializeCall (JsonRpc.Message.notification method) params?
 
 private partial def writeLoop (input : IO.FS.Stream) (state : Std.Mutex State) : EIO ClientError Unit := do
   try
@@ -321,23 +330,20 @@ private def Client.requestCore (client : Client) (method : String) (params? : Op
     (document? : Option (String × Int) := none) (internal : Bool := false) : EIO ClientError Json := do
   let deadline := (← IO.monoMsNow) + timeoutMs
   if ← cancellationRequested cancel? then throw <| ClientError.cancelled method
-  let encodedParams? := params?.map Json.compress
-  let encodedMethod := (toJson method).compress
-  if (← IO.monoMsNow) ≥ deadline then throw <| ClientError.deadline method
+  -- Reserve only the ID so encoding can run outside the state mutex.
   let id ← client.state.atomically do
+    modifyGet fun s => (s.nextId, { s with nextId := s.nextId + 1 })
+  let payload := serializeCall (JsonRpc.Message.request (.num (JsonNumber.fromNat id)) method) params?
+  if ← cancellationRequested cancel? then throw <| ClientError.cancelled method
+  client.state.atomically do
+    if (← IO.monoMsNow) ≥ deadline then throw <| ClientError.deadline method
     let s ← get
     admit s internal
     checkDocument s document?
     if s.pending.size ≥ client.config.maxPendingRequests then
       throw ClientError.pendingFull
-    let id := s.nextId
-    let header := "{\"jsonrpc\":\"2.0\",\"id\":" ++ toString id ++ ",\"method\":" ++ encodedMethod
-    let payload := (match encodedParams? with
-      | some params => header ++ ",\"params\":" ++ params
-      | none => header) ++ "}"
     let s ← enqueue client.config s { payload, requestId? := some id, deadline }
-    set { s with nextId := id + 1, pending := s.pending.insert id none }
-    return id
+    set { s with pending := s.pending.insert id none }
   try
     repeat
       if ← cancellationRequested cancel? then throw <| ClientError.cancelled method

@@ -221,6 +221,7 @@ while True:
         document_request = request_id
         send({"method": "test/held-" + params["tag"], "params": {}})
     elif method == "test/hold-next-token":
+        assert "params" in message and params is None, message
         hold_next_token = True
     elif method == "test/release-document":
         reply(document_request, "obsolete")
