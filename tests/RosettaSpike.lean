@@ -607,22 +607,27 @@ private def assertCheck (condition : Bool) (message : String) : EIO ClientError 
 Unicode and CRLF exercise token slicing without using any Rust-specific syntax. -/
 def workspaceChecks (server : String) : EIO ClientError Unit :=
   IO.FS.withTempFile fun indexHandle indexFile => IO.FS.withTempFile fun targetHandle targetFile => do
-    indexHandle.putStr "index\n"
+    let symbolText := "pub fn measure() {}\n"
+    let targetText := "😀fn measure() { 1 }\r\n"
+    indexHandle.putStr symbolText
     indexHandle.flush
-    targetHandle.putStr "😀fn measure() { 1 }\r\n"
+    targetHandle.putStr targetText
     targetHandle.flush
     let sourceUri := (System.Uri.pathToUri indexFile : String)
     let targetUri := (System.Uri.pathToUri targetFile : String)
-    Client.withSession {
+    let workspaceConfig (uri : String) (options : List (String × Json)) : ClientConfig := {
         command := "python3", args := #[server], root := "."
-        retainedNotificationMethods := #["test/status", "test/null-status", "missing/readiness"]
-        initializationOptions := Json.mkObj [
-          ("mode", "workspace"), ("sourceUri", toJson sourceUri), ("targetUri", toJson targetUri)] } fun client => do
+        initializationOptions := Json.mkObj <| [
+          ("mode", toJson "workspace"), ("sourceUri", toJson uri), ("targetUri", toJson targetUri)] ++ options }
+    Client.withSession { workspaceConfig sourceUri [] with
+        retainedNotificationMethods := #["test/status", "test/null-status", "missing/readiness"] } fun client => do
       assertCheck ((← client.latestNotification "test/status").any (fun params =>
         (params.getObjValAs? Bool "ready").toOption == some false))
         "notification sent during initialization was lost"
       let definition ← client.sourceDefinition "test-language" "Container::measure" "::"
-      assertCheck (definition.definition.uri == targetUri) "definition location was ignored"
+      assertCheck (definition.definition.uri == targetUri &&
+        definition.definition.range == range 0 2 0 20 &&
+        definition.definition.selectionRange == range 0 5 0 12) "definition LocationLink ranges were ignored"
       assertCheck (String.join (definition.pieces.toList.map HighlightedPiece.text) == "fn measure() { 1 }")
         "source slice did not preserve the exact definition range"
       assertCheck (definition.pieces.any (fun piece => piece.tokenType == "function" &&
@@ -634,7 +639,7 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       let deferred ← client.workspaceSymbols "deferred"
       assertCheck (deferred.size == 1 && (deferred[0]?).any (fun symbol => symbol.location.uri == sourceUri))
         "deferred workspace symbol location was not resolved"
-      let indexOverlay ← client.openDocument sourceUri "another-language" "index\n"
+      let indexOverlay ← client.openDocument sourceUri "another-language" symbolText
       check (← failsWith (client.workspaceDefinition "test-language" "Container::measure" "::")
         (fun error => error matches .invalidInput "cannot change a borrowed document language"))
         "workspace lookup accepted an overlay with a different language"
@@ -738,30 +743,83 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       assertCheck (match unconfigured with | .error (.invalidInput _) => true | _ => false)
         "readiness wait accepted an unconfigured notification method"
       IO.println "Workspace lookup, definition following, ambiguity and Unicode highlighting passed"
-    for tokenMode in #["range", "full", "null", "none"] do
-      Client.withSession {
-          command := "python3", args := #[server], root := "."
-          initializationOptions := Json.mkObj [
-            ("mode", "workspace"), ("sourceUri", toJson sourceUri), ("targetUri", toJson targetUri),
-            ("tokenMode", toJson tokenMode)] } fun client => do
+    for definitionMode in #["identifier-only", "empty", "absent", "disabled"] do
+      let uri := if definitionMode == "disabled" then "untitled:workspace-symbol" else sourceUri
+      Client.withSession (workspaceConfig uri [
+          ("definitionMode", toJson definitionMode), ("tokenMode", "none")]) fun client => do
+        -- The symbol range begins at the modifier. Only the identifier resolves.
+        if definitionMode == "identifier-only" then
+          client.withDocument uri "test-language" symbolText fun document => do
+            assertCheck ((← document.definitions ⟨0, 0⟩).isEmpty) "modifier position unexpectedly resolved"
+            assertCheck ((← document.definitions ⟨0, 7⟩).size == 1) "identifier position did not resolve"
+        let source := client.sourceDefinition "test-language" "Container::measure" "::"
+        let definition ← if definitionMode == "disabled" then do
+            let location ← client.workspaceDefinition "test-language" "Container::measure" "::"
+            assertCheck (location.uri == uri) "workspace lookup tried to read a location-only target"
+            assertCheck (← failsWith source (fun error => error matches .unsupported _))
+              "the source helper hid the unsupported URI"
+            let overlay ← client.openDocument uri "test-language" symbolText
+            assertCheck (← failsWith (client.sourceDefinition "another-language" "Container::measure" "::")
+              (fun error => error matches .invalidInput "cannot change a borrowed document language"))
+              "plain source fallback accepted an overlay with a different language"
+            let definition ← source
+            assertCheck ((← overlay.text) == symbolText) "plain source fallback closed the overlay"
+            overlay.close
+            pure definition
+          else source
+        assertCheck (definition.definition.uri == uri &&
+          definition.definition.range == range 0 0 0 19 &&
+          definition.definition.selectionRange == definition.definition.range)
+          s!"{definitionMode}: unique workspace symbol fallback was lost"
+        assertCheck (definition.pieces.size == 1 &&
+          definition.pieces[0]!.text == "pub fn measure() {}" &&
+          definition.pieces[0]!.tokenType.isEmpty && definition.pieces[0]!.modifiers.isEmpty)
+          s!"{definitionMode}: fallback source was not preserved uncolored"
+        assertCheck ((← client.document? uri).isNone) "fallback source document remained open"
+    for tokenMode in #["range", "full", "null", "none", "absent"] do
+      Client.withSession (workspaceConfig sourceUri [("tokenMode", toJson tokenMode)]) fun client => do
         assertCheck ((← client.latestNotification "test/status").isNone)
           "retained state leaked into another session"
-        let result ← (client.sourceDefinition "test-language" "Container::measure" "::").toBaseIO
-        if tokenMode == "none" then
-          assertCheck (match result with | .error (.unsupported _) => true | _ => false)
-            "unsupported token methods were requested"
-        else
-          let definition ← EIO.ofExcept result
-          assertCheck (String.join (definition.pieces.toList.map HighlightedPiece.text) == "fn measure() { 1 }")
-            s!"{tokenMode}: source slice changed"
-          assertCheck ((definition.pieces.any (fun piece => piece.tokenType == "function")) == (tokenMode != "null"))
-            s!"{tokenMode}: token result was mishandled"
+        let definition ← client.sourceDefinition "test-language" "Container::measure" "::"
+        assertCheck (String.join (definition.pieces.toList.map HighlightedPiece.text) == "fn measure() { 1 }")
+          s!"{tokenMode}: source slice changed"
+        assertCheck ((definition.pieces.any (fun piece => piece.tokenType == "function")) ==
+          (tokenMode == "range" || tokenMode == "full")) s!"{tokenMode}: token result was mishandled"
+        if tokenMode == "none" || tokenMode == "absent" then
+          let wholeRange := range 0 0 1 0
+          let plain ← client.highlightDefinition "test-language" { definition.definition with range := wholeRange }
+          assertCheck (plain.pieces.size == 1 && plain.pieces[0]!.text == targetText &&
+            plain.pieces[0]!.tokenType.isEmpty && plain.pieces[0]!.modifiers.isEmpty)
+            "unsupported tokens changed Unicode or CRLF in the exact excerpt"
+          assertCheck (← failsWith (client.highlightDefinition "test-language" {
+            definition.definition with range := range 0 100 0 101 }) (fun error => error matches .protocol _))
+            "unsupported tokens hid an invalid source range"
+          client.withDocument targetUri "test-language" targetText fun document => do
+            assertCheck (← failsWith (document.semanticTokens (some wholeRange))
+              (fun error => error matches .unsupported _)) "the direct token request lost its capability error"
         if tokenMode == "range" then
-          let document ← client.openDocument targetUri "test-language" "😀fn measure() { 1 }\r\n"
-          let full ← try (document.semanticTokens).toBaseIO finally document.close
-          assertCheck (match full with | .error (.unsupported _) => true | _ => false)
-            "range-only server received a full-document request"
-    IO.println "Semantic token negotiation, full fallback, null results and readiness passed"
+          client.withDocument targetUri "test-language" targetText fun document => do
+            assertCheck (← failsWith document.semanticTokens (fun error => error matches .unsupported _))
+              "range-only server received a full-document request"
+    for feature in #["definitionMode", "tokenMode"] do
+      let modes := #["server-error", "disconnect", "protocol", "deadline"]
+      let modes := if feature == "definitionMode" then modes.push "multiple" else modes
+      for failureMode in modes do
+        Client.withSession { workspaceConfig sourceUri [(feature, toJson failureMode)] with
+            timeoutMs := 1000 } fun client => do
+          let result ← (client.sourceDefinition "test-language" "Container::measure" "::").toBaseIO
+          let detail := match result with | .ok _ => "success" | .error error => toString error
+          assertCheck (match result with
+            | .error error =>
+              match failureMode, error with
+              | "server-error", .server (-32601) _ _ => true
+              | "disconnect", .documentCleanup _ .disconnected (some .disconnected) => true
+              | "protocol", .protocol _ => true
+              | "deadline", .deadline _ => true
+              | "multiple", .invalidInput _ => true
+              | _, _ => false
+            | .ok _ => false) s!"{feature}: fallback erased {failureMode}: {detail}"
+    IO.println "Workspace fallback, semantic token negotiation and typed failures passed"
 
 def main (args : List String) : IO Unit := do
   match args with

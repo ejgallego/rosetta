@@ -73,26 +73,39 @@ Client.withSession config fun client => do
   client.sourceDefinition "rust" "EdwardsPoint::compress" "::"
 ```
 
-`Client.sourceDefinition` searches by the final component, filters fuzzy results
-to an exact name and optional container supplied by the author, and requires a
-unique location. It asks `definition` at that location, follows the returned
-file URI, and highlights its returned range. The result is a
-`HighlightedDefinition` with the original `DefinitionTarget`, language ID, and
-lossless text pieces carrying semantic token types and modifiers. Token spans
-intersecting the range boundaries are clipped, preserving Unicode and CRLF.
-An already-open document supplies its overlay and remains open. Otherwise the
-helper reads the file and scopes its temporary document. Non-file URIs without
-an open overlay are reported as unsupported. Borrowing requires the overlay's
-language ID to match the requested language. `withDocument` also requires
-identical text. Scoped callbacks must retain the admitted version until release.
-An edit or explicit close invalidates that version. `ClientError.documentCleanup`
-reports the release failure and retains any callback error.
+`Client.workspaceDefinition` searches by the final component, filters candidates
+to the exact name and optional authored container, and requires a unique
+location. If the server advertises definition support, the helper requests
+the definition at the symbol range's start and prefers a unique returned target.
+A symbol range can start at a modifier before the identifier, so the request
+may return `null` or an empty array. In either case the helper uses the workspace
+symbol's URI and assigns its range to both `range` and `selectionRange`. When
+`definitionProvider` is omitted or false, the helper returns the symbol
+location without opening or reading its source.
 
-The lower-level operations `Client.workspaceDefinition` and
-`Client.highlightDefinition` can be used separately. Missing or ambiguous names
-produce `ClientError.invalidInput`; protocol, server, and unsupported-feature
-errors keep their existing types. A Location-only server controls the source
-extent it returns; Rosetta does not invent a larger declaration range.
+`Client.highlightDefinition` highlights the exact range of a supplied
+`DefinitionTarget`. `Client.sourceDefinition` combines lookup and highlighting.
+Both return a `HighlightedDefinition` containing the selected target, language ID,
+and lossless text pieces. Color comes from semantic token types and modifiers.
+When neither range nor full tokens are available for the excerpt, the pieces
+contain plain text with empty token types and modifiers. `Document.semanticTokens`
+still reports `ClientError.unsupported` to direct callers. Token spans intersecting
+the excerpt boundaries are clipped, preserving Unicode and CRLF. The server
+chooses the extent of the excerpt. A `LocationLink` can supply a full definition
+range, while a workspace symbol or `Location` can cover only a name or signature.
+
+When these helpers need a source document, an already-open document supplies its
+overlay and remains open. Otherwise they read the file and scope a temporary
+document. A non-file URI requires an open overlay for source access. Borrowing
+requires the overlay's language ID to match the requested language.
+`withDocument` also requires identical text. Scoped callbacks must retain the
+admitted version until release. An edit or explicit close invalidates that
+version. `ClientError.documentCleanup` reports the release failure and retains
+any callback error.
+
+Missing or ambiguous workspace symbols and multiple definition targets produce
+`ClientError.invalidInput`. Protocol, server, transport, deadline, and
+source-reading failures still propagate.
 
 This is workspace symbol discovery, not compiler resolution of expressions or
 imports. Qualification matches the server's `containerName` exactly; supported
@@ -185,7 +198,7 @@ There are four distinct operations:
 - `lspRef` queries an expression in that context's composed scope, using the
   profile's language-specific wrapper. It does not search a workspace index.
 - `workspaceSymbols` / `workspaceDefinition` discover a unique server-reported
-  name/container candidate and follow its definition.
+  name/container candidate and prefer its definition when available.
 - `highlightDefinition` presents an existing source range, using an open overlay
   when available. Its lossless `HighlightedPiece` view serves source excerpts;
   `SemanticSpan` serves overlays on separately owned authored text.

@@ -75,9 +75,10 @@ private def withSourceDocument (client : Client) (uri languageId : String)
     return ← document.withBorrowed languageId action
   client.withDocument uri languageId (← readSource uri) action
 
-/-- Find an exact name/container pair among workspace search candidates, then ask
-`definition` at its returned position. Never choose an arbitrary fuzzy match.
-`separator` describes the author's reference syntax, not a server query syntax. -/
+/-- Find a unique exact workspace symbol. Prefer a unique definition target when
+advertised. With an unavailable provider or empty result, use the symbol's
+range for both target ranges.
+`separator` describes how to split the authored reference into name and container. -/
 def Client.workspaceDefinition (client : Client) (languageId reference separator : String) :
     EIO ClientError DefinitionTarget := do
   unless !separator.isEmpty do throw <| ClientError.invalidInput "empty reference separator"
@@ -95,8 +96,13 @@ def Client.workspaceDefinition (client : Client) (languageId reference separator
   unless locations.size == 1 do
     throw <| ClientError.invalidInput s!"Expected one workspace symbol for {reference}, found {locations.size}"
   let location := locations[0]!
+  let fallback : DefinitionTarget := {
+    uri := location.uri, range := location.range, selectionRange := location.range }
+  let provider := (← client.capabilities).getObjValD "definitionProvider"
+  if provider == .null || provider == .bool false then return fallback
   let targets ← withSourceDocument client location.uri languageId fun document =>
     document.definitions location.range.start
+  if targets.isEmpty then return fallback
   unless targets.size == 1 do
     throw <| ClientError.invalidInput s!"Expected one definition for {reference}, found {targets.size}"
   return targets[0]!
@@ -114,8 +120,8 @@ structure HighlightedDefinition where
   pieces : Array HighlightedPiece
   deriving ToJson, FromJson
 
-/-- Read and highlight the exact range returned by the server. LocationLink
-preserves a full definition range; a Location-only server controls its own extent. -/
+/-- Read and highlight the exact range returned by the server. Return plain text
+when semantic tokens are unsupported. A LocationLink can supply a full definition range. -/
 def Client.highlightDefinition (client : Client) (languageId : String) (target : DefinitionTarget) :
     EIO ClientError HighlightedDefinition := do
   withSourceDocument client target.uri languageId fun document => do
@@ -123,7 +129,10 @@ def Client.highlightDefinition (client : Client) (languageId : String) (target :
     let index := SourceIndex.ofString text
     let some (start, stop) := index.byteRange? target.range
       | throw <| ClientError.protocol "invalid definition range"
-    let spans ← document.semanticTokens (some target.range)
+    let spans ← try document.semanticTokens (some target.range) catch error =>
+      match error with
+      | .unsupported _ => pure #[]
+      | _ => throw error
     let mut pieces := #[]
     let mut offset := start
     for span in spans do
@@ -141,7 +150,7 @@ def Client.highlightDefinition (client : Client) (languageId : String) (target :
     if offset < stop then pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨stop⟩ }
     return { definition := target, languageId, pieces }
 
-/-- Resolve an authored workspace reference and highlight its returned definition. -/
+/-- Resolve an authored workspace reference and highlight the chosen source range. -/
 def Client.sourceDefinition (client : Client) (languageId reference separator : String) :
     EIO ClientError HighlightedDefinition := do
   client.highlightDefinition languageId (← client.workspaceDefinition languageId reference separator)

@@ -79,3 +79,18 @@ On Linux, session close checks the owned process group through readable procfs
 before reaping its leader. Descendants with redirected stdio require
 termination and set `CloseReport.forced`. Inspection and termination errors
 appear in `CloseReport.errors`.
+
+## Workspace source fallback
+
+`Client.workspaceDefinition` now returns the unique exact workspace symbol
+location when the server omits or disables definition support or returns no
+definition targets. In that case, both `range` and `selectionRange` describe
+the symbol's range, which may begin at a modifier and cover only part of the
+declaration. A unique definition target still takes precedence. Multiple
+definition targets and request failures remain errors.
+
+`Client.highlightDefinition` and `Client.sourceDefinition` now return the
+exact plain-text excerpt when semantic token support is unavailable. Callers
+can remove fallbacks that handled `ClientError.unsupported` specifically for
+missing token support in these helpers. Direct calls to `Document.semanticTokens`
+still report that error. Source access and document scope errors still propagate.
