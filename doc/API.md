@@ -52,77 +52,76 @@ validation/matching (`Bundle.validate`, `Bundle.find`), and the Verso bridge
 retain their existing responsibilities. The current `VersoRosetta.collect` and
 `VersoRosetta.enrich` entry points operate on Manual parts and remain pure.
 
-## Workspace references and highlighted definitions
+## Workspace symbols and source excerpts
 
-`Client.workspaceSymbols query` wraps `workspace/symbol`, including deferred
-locations via `workspaceSymbol/resolve`. `Document.definitions position` wraps
-`textDocument/definition` and preserves both full and selection ranges from
-LocationLink. `Document.semanticTokens range?` requests and decodes semantic tokens
-against the exact opened document text. When a range is supplied and the server
-supports range tokens, it requests only that range; otherwise it requests full
-document tokens.
-Rosetta advertises both request forms and never sends an unadvertised full
-request to a range-only server. A `null` token result means no coloring; the
-source slice is still preserved. The handle supplies its admitted version's text; callers cannot supply a mismatching buffer.
-
-For a named reference, use:
+To display a named symbol, pass its name and optional container separately.
+The following call reads a Rust method after the server has indexed the project.
 
 ```lean
-Client.withSession config fun client => do
-  -- Wait for the project's server to finish loading, when necessary.
-  client.sourceDefinition "rust" "EdwardsPoint::compress" "::"
+client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")
 ```
 
-`Client.workspaceDefinition` searches by the final component, filters candidates
-to the exact name and optional authored container, and requires a unique
-location. If the server advertises definition support, the helper requests
-the definition at the symbol range's start and prefers a unique returned target.
-A symbol range can start at a modifier before the identifier, so the request
-may return `null` or an empty array. In either case the helper uses the workspace
-symbol's URI and assigns its range to both `range` and `selectionRange`. When
-`definitionProvider` is omitted or false, the helper returns the symbol
-location without opening or reading its source.
+The result contains the exact source `pieces`, their `languageId`, and the
+lookup information used to choose the excerpt.
 
-`Client.highlightDefinition` highlights the exact range of a supplied
-`DefinitionTarget`. `Client.sourceDefinition` combines lookup and highlighting.
-Both return a `HighlightedDefinition` containing the selected target, language ID,
-and lossless text pieces. Color comes from semantic token types and modifiers.
-When neither range nor full tokens are available for the excerpt, the pieces
-contain plain text with empty token types and modifiers. `Document.semanticTokens`
-still reports `ClientError.unsupported` to direct callers. Token spans intersecting
-the excerpt boundaries are clipped, preserving Unicode and CRLF. The server
-chooses the extent of the excerpt. A `LocationLink` can supply a full definition
-range, while a workspace symbol or `Location` can cover only a name or signature.
+- `symbolLocation : Lsp.Location` is the unique matching location from
+  `workspace/symbol`. Rosetta sends the name as the query and filters the
+  candidates by exact name and, when supplied, exact `containerName`.
+  It resolves missing ranges only for matching candidates. Duplicate hits at
+  the same URI and range count as one location. The container is the string
+  reported by the server. Callers choose how to parse qualified names.
+- `definition? : Option DefinitionTarget` holds the single target returned by
+  `textDocument/definition` at the start of the indexed range. A
+  `LocationLink` preserves the target's full range and selection range. If
+  definition support is absent or disabled, Rosetta skips the request. A
+  skipped request and a reply of `null` or `[]` both produce `none`.
 
-When these helpers need a source document, an already-open document supplies its
-overlay and remains open. Otherwise they read the file and scope a temporary
-document. A non-file URI requires an open overlay for source access. Borrowing
-requires the overlay's language ID to match the requested language.
-`withDocument` also requires identical text. Scoped callbacks must retain the
-admitted version until release. An edit or explicit close invalidates that
-version. `ClientError.documentCleanup` reports the release failure and retains
-any callback error.
+For example, the symbol range for `pub fn measure() {}` might start on
+`pub`, where a definition request can return no target. Rosetta then uses
+the indexed range for the excerpt. When the prover supplies a definition,
+Rosetta uses its target range, which can be in another file. The prover
+determines how much source the excerpt covers.
 
-Missing or ambiguous workspace symbols and multiple definition targets produce
-`ClientError.invalidInput`. Protocol, server, transport, deadline, and
-source-reading failures still propagate.
+Use `client.lookupSymbol languageId name (container? := some container)` for
+the locations alone. Its `SymbolLookup.displayLocation` accessor selects the
+same location that `symbolSource` uses. With definition support disabled,
+the lookup can return the indexed location without opening the document.
+For a list of search results, `client.workspaceSymbols query` returns all
+candidates with resolved locations. For Go to Definition at a known position,
+`document.definitions position` returns the prover's targets, including an
+empty array or several targets.
 
-This is workspace symbol discovery, not compiler resolution of expressions or
-imports. Qualification matches the server's `containerName` exactly; supported
-container depth is determined by the server. For a Rust expression in a known
-scope, use `Document.definitions` or the existing `ContextProfile` analysis.
+Use `client.sourceExcerpt languageId location` to read any `Lsp.Location`.
+When the document is open, Rosetta borrows its current overlay and checks
+that the language matches. Otherwise it reads the file and opens a temporary
+document. A non-file URI needs an open overlay. A concurrent edit or close
+that invalidates a borrowed version is reported at scope release.
+
+Concatenating `pieces` reproduces the selected source text, including Unicode
+and CRLF. Rosetta requests range tokens when available and otherwise uses full
+tokens when supported. It clips tokens at the excerpt boundaries. Missing token
+support or a null token result yields plain text. A caller explicitly requesting
+tokens with `document.semanticTokens range?` receives `ClientError.unsupported`
+when the requested operation is unavailable.
+
+Named lookup reports `ClientError.invalidInput` for an empty name or supplied
+empty container, zero or several distinct matching locations, or several
+definition targets. Malformed replies, server errors, timeouts, disconnections,
+and source-reading failures propagate to the caller.
 
 Initialization options remain caller-owned. For example, rust-analyzer needs
 `workspace.symbol.search.kind = "all_symbols"` to include methods. Workspace
-indexing readiness is also server-specific. Configure the methods whose latest
-params must survive unrelated traffic **before starting the session**:
+indexing readiness is also server-specific. For rust-analyzer, enable status
+notifications and retain the latest status before starting the session.
 
 ```lean
 Client.withSession { config with
-    retainedNotificationMethods := #["experimental/serverStatus"] } fun client => do
+    experimentalCapabilities := config.experimentalCapabilities.mergeObj
+      (Json.mkObj [("serverStatusNotification", toJson true)])
+    retainedNotificationMethods := config.retainedNotificationMethods.push "experimental/serverStatus" } fun client => do
   client.waitForNotification "experimental/serverStatus" (fun status =>
     (status.getObjValAs? Bool "quiescent").toOption == some true) 30000
-  client.sourceDefinition "rust" "EdwardsPoint::compress" "::"
+  client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")
 ```
 
 `Client.latestNotification method : BaseIO (Option Json)` returns the latest
@@ -197,11 +196,10 @@ There are four distinct operations:
 - `lspCode` records authored source to analyze in a registered context.
 - `lspRef` queries an expression in that context's composed scope, using the
   profile's language-specific wrapper. It does not search a workspace index.
-- `workspaceSymbols` / `workspaceDefinition` discover a unique server-reported
-  name/container candidate and prefer its definition when available.
-- `highlightDefinition` presents an existing source range, using an open overlay
-  when available. Its lossless `HighlightedPiece` view serves source excerpts;
-  `SemanticSpan` serves overlays on separately owned authored text.
+- `lookupSymbol` finds a unique indexed location and records any definition the
+  prover supplies at the start of that range.
+- `sourceExcerpt` presents an existing source range, using an open overlay when
+  available. `symbolSource` combines lookup and excerpt in one call.
 
 `analyze` degrades explicit optional-feature server errors into `Outcome.failed`
 and unavailable capabilities into `Outcome.unsupported`. Transport, protocol,

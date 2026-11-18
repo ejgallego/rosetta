@@ -8,21 +8,30 @@ public section
 namespace Rosetta
 open Lean
 
-/-- Search results are candidates, not compiler name resolution. -/
-def Client.workspaceSymbols (client : Client) (query : String) :
-    EIO ClientError (Array Lsp.SymbolInformation) := do
+private def Client.requestWorkspaceSymbols (client : Client) (query : String) :
+    EIO ClientError (Array Json) := do
   let result ← client.request "workspace/symbol" <| Json.mkObj [("query", toJson query)]
   if result == .null then return #[]
-  let values ← EIO.ofExcept <| result.getArr?.mapError ClientError.protocol
-  values.mapM fun value => do
-    -- LSP WorkspaceSymbol may defer its location range until resolve.
-    let value ← if (value.getObjVal? "location" >>= (·.getObjVal? "range")).isOk then
-        pure value
-      else client.request "workspaceSymbol/resolve" value
-    -- LSP tags are optional; Lean's SymbolInformation decoder expects an array.
-    let value := if value.getObjValD "tags" == .null then
-        value.setObjVal! "tags" (.arr #[]) else value
-    EIO.ofExcept <| (fromJson? value).mapError ClientError.protocol
+  EIO.ofExcept <| result.getArr?.mapError ClientError.protocol
+
+private def Client.resolveWorkspaceSymbol (client : Client) (value : Json) :
+    EIO ClientError Lsp.SymbolInformation := do
+  let location ← EIO.ofExcept <| (value.getObjVal? "location").mapError ClientError.protocol
+  discard <| EIO.ofExcept <| (location.getObjValAs? Lsp.DocumentUri "uri").mapError ClientError.protocol
+  -- LSP WorkspaceSymbol may defer its location range until resolve.
+  let value ← if (location.getObjVal? "range").isOk then
+      pure value
+    else client.request "workspaceSymbol/resolve" value
+  let .obj _ := value | throw <| ClientError.protocol "expected a workspace symbol object"
+  -- LSP tags are optional; Lean's SymbolInformation decoder expects an array.
+  let value := if value.getObjValD "tags" == .null then
+      value.setObjVal! "tags" (.arr #[]) else value
+  EIO.ofExcept <| (fromJson? value).mapError ClientError.protocol
+
+/-- Search the workspace and resolve deferred locations in all returned candidates. -/
+def Client.workspaceSymbols (client : Client) (query : String) :
+    EIO ClientError (Array Lsp.SymbolInformation) := do
+  (← client.requestWorkspaceSymbols query).mapM client.resolveWorkspaceSymbol
 
 /-- Ask for definitions at a position in an admitted document version. -/
 def Document.definitions (document : Document) (position : Lsp.Position) :
@@ -75,37 +84,52 @@ private def withSourceDocument (client : Client) (uri languageId : String)
     return ← document.withBorrowed languageId action
   client.withDocument uri languageId (← readSource uri) action
 
-/-- Find a unique exact workspace symbol. Prefer a unique definition target when
-advertised. With an unavailable provider or empty result, use the symbol's
-range for both target ranges.
-`separator` describes how to split the authored reference into name and container. -/
-def Client.workspaceDefinition (client : Client) (languageId reference separator : String) :
-    EIO ClientError DefinitionTarget := do
-  unless !separator.isEmpty do throw <| ClientError.invalidInput "empty reference separator"
-  let parts := reference.splitOn separator
-  unless parts.all (!·.isEmpty) do throw <| ClientError.invalidInput "empty reference component"
-  let name := parts.getLast!
-  let container := String.intercalate separator parts.dropLast
-  let candidates ← client.workspaceSymbols name
-  let candidates := candidates.filter fun symbol => symbol.name == name &&
-    (container.isEmpty || symbol.containerName? == some container)
+/-- A unique exact workspace symbol location and its optional definition target. -/
+structure SymbolLookup where
+  symbolLocation : Lsp.Location
+  definition? : Option DefinitionTarget
+  deriving ToJson, FromJson
+
+/-- Use the full definition range when available, or the workspace symbol location. -/
+def SymbolLookup.displayLocation (lookup : SymbolLookup) : Lsp.Location :=
+  match lookup.definition? with
+  | some target => { uri := target.uri, range := target.range }
+  | none => lookup.symbolLocation
+
+/-- Find a unique location for an exact name and optional container. When the
+server advertises definitions, look up a target at the start of the symbol range. -/
+def Client.lookupSymbol (client : Client) (languageId name : String)
+    (container? : Option String := none) : EIO ClientError SymbolLookup := do
+  if name.isEmpty then throw <| ClientError.invalidInput "empty symbol name"
+  if container?.any String.isEmpty then throw <| ClientError.invalidInput "empty symbol container"
+  let description := match container? with
+    | some container => s!"{name} in {container}"
+    | none => name
   let mut locations : Array Lsp.Location := #[]
-  for candidate in candidates do
-    unless locations.any (fun location => toJson location == toJson candidate.location) do
-      locations := locations.push candidate.location
+  for value in ← client.requestWorkspaceSymbols name do
+    -- Fuzzy hits may require resolution, so filter on the raw identity first.
+    let candidateName ← EIO.ofExcept <| (value.getObjValAs? String "name").mapError ClientError.protocol
+    unless candidateName == name do continue
+    if let some container := container? then
+      let candidateContainer? ← EIO.ofExcept <|
+        (value.getObjValAs? (Option String) "containerName").mapError ClientError.protocol
+      unless candidateContainer? == some container do continue
+    let symbol ← client.resolveWorkspaceSymbol value
+    unless symbol.name == name && container?.all (fun container => symbol.containerName? == some container) do
+      throw <| ClientError.protocol "workspace symbol resolution changed the requested name or container"
+    unless locations.contains symbol.location do
+      locations := locations.push symbol.location
   unless locations.size == 1 do
-    throw <| ClientError.invalidInput s!"Expected one workspace symbol for {reference}, found {locations.size}"
-  let location := locations[0]!
-  let fallback : DefinitionTarget := {
-    uri := location.uri, range := location.range, selectionRange := location.range }
+    throw <| ClientError.invalidInput s!"Expected one workspace symbol for {description}, found {locations.size}"
+  let symbolLocation := locations[0]!
   let provider := (← client.capabilities).getObjValD "definitionProvider"
-  if provider == .null || provider == .bool false then return fallback
-  let targets ← withSourceDocument client location.uri languageId fun document =>
-    document.definitions location.range.start
-  if targets.isEmpty then return fallback
-  unless targets.size == 1 do
-    throw <| ClientError.invalidInput s!"Expected one definition for {reference}, found {targets.size}"
-  return targets[0]!
+  if provider == .null || provider == .bool false then
+    return { symbolLocation, definition? := none }
+  let targets ← withSourceDocument client symbolLocation.uri languageId fun document =>
+    document.definitions symbolLocation.range.start
+  if targets.size > 1 then
+    throw <| ClientError.invalidInput s!"Expected at most one definition for {description}, found {targets.size}"
+  return { symbolLocation, definition? := targets[0]? }
 
 /-- A lossless source slice with optional LSP semantic coloring. -/
 structure HighlightedPiece where
@@ -114,22 +138,21 @@ structure HighlightedPiece where
   modifiers : Array String := #[]
   deriving Inhabited, ToJson, FromJson
 
-structure HighlightedDefinition where
-  definition : DefinitionTarget
+/-- The exact text of a source range, with semantic coloring when available. -/
+structure SourceExcerpt where
   languageId : String
   pieces : Array HighlightedPiece
   deriving ToJson, FromJson
 
-/-- Read and highlight the exact range returned by the server. Return plain text
-when semantic tokens are unsupported. A LocationLink can supply a full definition range. -/
-def Client.highlightDefinition (client : Client) (languageId : String) (target : DefinitionTarget) :
-    EIO ClientError HighlightedDefinition := do
-  withSourceDocument client target.uri languageId fun document => do
+/-- Read the exact source range. Return plain text when semantic tokens are unsupported. -/
+def Client.sourceExcerpt (client : Client) (languageId : String) (location : Lsp.Location) :
+    EIO ClientError SourceExcerpt := do
+  withSourceDocument client location.uri languageId fun document => do
     let text ← document.text
     let index := SourceIndex.ofString text
-    let some (start, stop) := index.byteRange? target.range
-      | throw <| ClientError.protocol "invalid definition range"
-    let spans ← try document.semanticTokens (some target.range) catch error =>
+    let some (start, stop) := index.byteRange? location.range
+      | throw <| ClientError.protocol "invalid source range"
+    let spans ← try document.semanticTokens (some location.range) catch error =>
       match error with
       | .unsupported _ => pure #[]
       | _ => throw error
@@ -148,11 +171,17 @@ def Client.highlightDefinition (client : Client) (languageId : String) (target :
         tokenType := span.tokenType, modifiers := span.modifiers }
       offset := right
     if offset < stop then pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨stop⟩ }
-    return { definition := target, languageId, pieces }
+    return { languageId, pieces }
 
-/-- Resolve an authored workspace reference and highlight the chosen source range. -/
-def Client.sourceDefinition (client : Client) (languageId reference separator : String) :
-    EIO ClientError HighlightedDefinition := do
-  client.highlightDefinition languageId (← client.workspaceDefinition languageId reference separator)
+/-- Workspace symbol lookup and the source excerpt at its display location. -/
+structure SymbolSource extends SymbolLookup, SourceExcerpt where
+  deriving ToJson, FromJson
+
+/-- Look up a workspace symbol and read its display location. -/
+def Client.symbolSource (client : Client) (languageId name : String)
+    (container? : Option String := none) : EIO ClientError SymbolSource := do
+  let lookup ← client.lookupSymbol languageId name container?
+  let excerpt ← client.sourceExcerpt languageId lookup.displayLocation
+  return { toSymbolLookup := lookup, toSourceExcerpt := excerpt }
 
 end Rosetta

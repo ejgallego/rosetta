@@ -80,17 +80,22 @@ before reaping its leader. Descendants with redirected stdio require
 termination and set `CloseReport.forced`. Inspection and termination errors
 appear in `CloseReport.errors`.
 
-## Workspace source fallback
+## Named symbols and source excerpts
 
-`Client.workspaceDefinition` now returns the unique exact workspace symbol
-location when the server omits or disables definition support or returns no
-definition targets. In that case, both `range` and `selectionRange` describe
-the symbol's range, which may begin at a modifier and cover only part of the
-declaration. A unique definition target still takes precedence. Multiple
-definition targets and request failures remain errors.
+Pass the exact symbol name and optional server-reported container separately.
+For example, replace `client.sourceDefinition "rust" "Container::measure" "::"`
+with `client.symbolSource "rust" "measure" (container? := some "Container")`.
+For an unqualified name, omit `container?`.
 
-`Client.highlightDefinition` and `Client.sourceDefinition` now return the
-exact plain-text excerpt when semantic token support is unavailable. Callers
-can remove fallbacks that handled `ClientError.unsupported` specifically for
-missing token support in these helpers. Direct calls to `Document.semanticTokens`
-still report that error. Source access and document scope errors still propagate.
+| Previous API | Replacement |
+| --- | --- |
+| `Client.workspaceDefinition` | `Client.lookupSymbol` returns a `SymbolLookup`. Use `symbolLocation` for the indexed location, `definition?` for the prover's optional definition, or `displayLocation` for the preferred source location. |
+| `Client.highlightDefinition` | Pass an `Lsp.Location` to `Client.sourceExcerpt`. For an existing `DefinitionTarget` named `target`, pass `{ uri := target.uri, range := target.range }`. |
+| `Client.sourceDefinition` | `Client.symbolSource` returns a `SymbolSource` with the lookup fields, language ID, and text pieces. |
+| `HighlightedDefinition` | Use `SymbolSource` for named lookups or `SourceExcerpt` for excerpts at a supplied location. Regenerate saved values that used the old JSON shape. |
+
+An unavailable definition provider or empty definition reply now leaves
+`definition? = none`. The indexed range supplies the excerpt in that case.
+Use `document.definitions position` when you need every target the prover
+reports at a specific position. Missing token support gives a plain excerpt.
+Explicit `document.semanticTokens` requests still report unsupported operations.
