@@ -45,6 +45,7 @@ shutdown_seen = False
 source_uri = None
 target_uri = None
 token_mode = None
+definition_mode = None
 documents = {}
 
 
@@ -57,6 +58,19 @@ def send(message):
 
 def reply(request_id, result):
     send({"id": request_id, "result": result})
+
+
+def workspace_symbol(name, container, *, resolve=None):
+    location = {"uri": source_uri}
+    symbol = {"name": name, "kind": 12, "location": location}
+    if container is not None:
+        symbol["containerName"] = container
+    if resolve is None:
+        location["range"] = {"start": {"line": 0, "character": 1 if container == "Other" else 0},
+                             "end": {"line": 0, "character": 19}}
+    else:
+        symbol["data"] = resolve
+    return symbol
 
 
 def diagnostics(uri, version, message=None):
@@ -112,40 +126,73 @@ while True:
         source_uri = options.get("sourceUri")
         target_uri = options.get("targetUri")
         token_mode = options.get("tokenMode")
+        definition_mode = options.get("definitionMode")
         if mode == "workspace":
             assert params["capabilities"]["textDocument"]["semanticTokens"]["requests"]["range"] is True
             send({"method": "test/status", "params": {"ready": False}})
         if mode == "ignore-term":
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        reply(request_id, {"capabilities": {
+        capabilities = {
             "positionEncoding": "utf-8" if mode == "wrong-encoding" else "utf-16",
             "textDocumentSync": 2 if mode == "incremental" else 1,
-            "definitionProvider": True, "hoverProvider": mode != "local-definition",
-            **({"workspaceSymbolProvider": {"resolveProvider": True},
-                "semanticTokensProvider": {"full": token_mode not in ("range", "none"),
-                    "range": token_mode not in ("full", "none"), "legend": {
-                    "tokenTypes": ["keyword", "function", "number"],
-                    "tokenModifiers": ["declaration"]}}} if mode == "workspace" else {}),
-        }})
+            "hoverProvider": mode != "local-definition",
+        }
+        if definition_mode != "absent":
+            capabilities["definitionProvider"] = (
+                {} if definition_mode == "identifier-only" else definition_mode != "disabled")
+        if mode == "workspace":
+            capabilities["workspaceSymbolProvider"] = {"resolveProvider": True}
+            if token_mode != "absent":
+                capabilities["semanticTokensProvider"] = {
+                    "full": token_mode not in ("range", "none"),
+                    "range": token_mode not in ("full", "none"),
+                    "legend": {
+                        "tokenTypes": ["keyword", "function", "number"],
+                        "tokenModifiers": ["declaration"],
+                    },
+                }
+        reply(request_id, {"capabilities": capabilities})
     elif method == "workspace/symbol":
-        def symbol(name, container):
-            return {"name": name, "kind": 12, "containerName": container,
-                    "location": {"uri": source_uri, "range": {
-                        "start": {"line": 0, "character": 0 if container == "Container" else 1},
-                        "end": {"line": 0, "character": 5}}}}
         query = params["query"]
         if query == "measure":
-            reply(request_id, [symbol("measure", "Container"), symbol("measure", "Container"),
-                               symbol("measure", "Other"), symbol("measureMore", "Container")])
+            reply(request_id, [workspace_symbol("measure", "Container"), workspace_symbol("measure", "Container"),
+                               workspace_symbol("measure", "Other"), workspace_symbol("measureMore", "Container")])
         elif query == "deferred":
-            reply(request_id, [{"name": "deferred", "kind": 12,
-                                "location": {"uri": source_uri}, "data": 7}])
+            reply(request_id, [workspace_symbol("deferredMore", "Container", resolve="server-error"),
+                               workspace_symbol("deferredOther", 1, resolve="server-error"),
+                               workspace_symbol("deferred", "Other", resolve="protocol"),
+                               workspace_symbol("deferred", "Container", resolve="range")])
+        elif query == "deferredMore":
+            reply(request_id, [workspace_symbol(query, "Container", resolve="server-error")])
+        elif query == "raw-defer":
+            reply(request_id, [workspace_symbol("raw-deferred", None, resolve="range")])
+        elif query == " literal::measure ":
+            reply(request_id, [workspace_symbol(query, " Parent::Container ")])
+        elif query == "":
+            reply(request_id, [workspace_symbol(query, "Container")])
+        elif query == "empty-container":
+            reply(request_id, [workspace_symbol(query, "")])
+        elif query == "bad-name":
+            reply(request_id, [workspace_symbol(1, "Container"), workspace_symbol(query, "Container")])
+        elif query == "bad-container":
+            reply(request_id, [workspace_symbol(query, 1), workspace_symbol(query, "Container")])
+        elif query in ("bad-uri", "bad-range"):
+            symbol = workspace_symbol(query, "Container", resolve="server-error")
+            field = "uri" if query == "bad-uri" else "range"
+            symbol["location"][field] = 1
+            reply(request_id, [symbol])
         else:
             reply(request_id, [])
     elif method == "workspaceSymbol/resolve":
-        assert params["data"] == 7
-        params["location"]["range"] = {"start": {"line": 0, "character": 0},
-                                        "end": {"line": 0, "character": 5}}
+        if params["data"] == "server-error":
+            send({"id": request_id, "error": {"code": -32097, "message": "symbol resolution failed"}})
+            continue
+        if params["data"] == "protocol":
+            params["location"]["range"] = "invalid"
+        else:
+            assert params["data"] == "range"
+            params["location"]["range"] = {"start": {"line": 0, "character": 0},
+                                            "end": {"line": 0, "character": 5}}
         reply(request_id, params)
     elif method == "textDocument/definition" and mode == "local-definition":
         end = {1: 1, 2: 99}[params["position"]["line"]]
@@ -154,11 +201,32 @@ while True:
                             "targetRange": {"start": start, "end": {"line": 1, "character": 0}},
                             "targetSelectionRange": {"start": start, "end": {"line": 0, "character": end}}}])
     elif method == "textDocument/definition":
-        reply(request_id, [{"targetUri": target_uri,
-                            "targetRange": {"start": {"line": 0, "character": 2},
-                                            "end": {"line": 0, "character": 20}},
-                            "targetSelectionRange": {"start": {"line": 0, "character": 5},
-                                                     "end": {"line": 0, "character": 12}}}])
+        assert definition_mode not in ("absent", "disabled")
+        if definition_mode == "identifier-only" and params["position"] != {"line": 0, "character": 7}:
+            assert params["position"] == {"line": 0, "character": 0}
+            reply(request_id, None)
+            continue
+        if definition_mode == "empty":
+            reply(request_id, [])
+            continue
+        if definition_mode == "disconnect":
+            sys.exit(0)
+        if definition_mode == "deadline":
+            continue
+        if definition_mode == "server-error":
+            send({"id": request_id, "error": {"code": -32601, "message": "feature unavailable"}})
+            continue
+        if definition_mode == "protocol":
+            reply(request_id, [{"targetUri": target_uri}])
+            continue
+        target = {"targetUri": target_uri,
+                  "targetRange": {"start": {"line": 0, "character": 2},
+                                  "end": {"line": 0, "character": 20}},
+                  "targetSelectionRange": {"start": {"line": 0, "character": 5},
+                                           "end": {"line": 0, "character": 12}},
+                  "originSelectionRange": {"start": {"line": 0, "character": 7},
+                                           "end": {"line": 0, "character": 14}}}
+        reply(request_id, [target, target] if definition_mode == "multiple" else [target])
     elif method in ("textDocument/semanticTokens/full", "textDocument/semanticTokens/range"):
         if hold_next_token:
             hold_next_token = False
@@ -173,7 +241,9 @@ while True:
         if token_mode == "protocol":
             reply(request_id, {"data": [0]})
             continue
-        assert token_mode != "none"
+        if token_mode == "deadline":
+            continue
+        assert token_mode not in ("absent", "none")
         assert token_mode != "range" or method.endswith("/range")
         assert token_mode != "full" or method.endswith("/full")
         reply(request_id, None if token_mode == "null" else {

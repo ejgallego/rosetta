@@ -79,3 +79,23 @@ On Linux, session close checks the owned process group through readable procfs
 before reaping its leader. Descendants with redirected stdio require
 termination and set `CloseReport.forced`. Inspection and termination errors
 appear in `CloseReport.errors`.
+
+## Named symbols and source excerpts
+
+Pass the exact symbol name and optional server-reported container separately.
+For example, replace `client.sourceDefinition "rust" "Container::measure" "::"`
+with `client.symbolSource "rust" "measure" (container? := some "Container")`.
+For an unqualified name, omit `container?`.
+
+| Previous API | Replacement |
+| --- | --- |
+| `Client.workspaceDefinition` | `Client.lookupSymbol` returns a `SymbolLookup`. Use `symbolLocation` for the indexed location, `definition?` for the prover's optional definition, or `displayLocation` for the preferred source location. |
+| `Client.highlightDefinition` | Pass an `Lsp.Location` to `Client.sourceExcerpt`. For an existing `DefinitionTarget` named `target`, pass `{ uri := target.uri, range := target.range }`. |
+| `Client.sourceDefinition` | `Client.symbolSource` returns a `SymbolSource` with the lookup fields, language ID, and text pieces. |
+| `HighlightedDefinition` | Use `SymbolSource` for named lookups or `SourceExcerpt` for excerpts at a supplied location. Regenerate saved values that used the old JSON shape. |
+
+An unavailable definition provider or empty definition reply now leaves
+`definition? = none`. The indexed range supplies the excerpt in that case.
+Use `document.definitions position` when you need every target the prover
+reports at a specific position. Missing token support gives a plain excerpt.
+Explicit `document.semanticTokens` requests still report unsupported operations.
