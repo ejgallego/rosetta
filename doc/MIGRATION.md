@@ -89,13 +89,13 @@ For an unqualified name, omit `container?`.
 
 | Previous API | Replacement |
 | --- | --- |
-| `Client.workspaceDefinition` | `Client.lookupSymbol` returns a `SymbolLookup`. Use `symbolLocation` for the indexed location, `definition?` for the prover's optional definition, or `displayLocation` for the preferred source location. |
-| `Client.highlightDefinition` | Pass an `Lsp.Location` to `Client.sourceExcerpt`. For an existing `DefinitionTarget` named `target`, pass `{ uri := target.uri, range := target.range }`. |
-| `Client.sourceDefinition` | `Client.symbolSource` returns a `SymbolSource` with the lookup fields, language ID, and text pieces. |
-| `HighlightedDefinition` | Use `SymbolSource` for named lookups or `SourceExcerpt` for excerpts at a supplied location. Regenerate saved values that used the old JSON shape. |
+| `Client.workspaceDefinition` | Call `client.lookupSymbol name (container? := some container)` for the indexed `Lsp.Location`. Lookup no longer takes a language ID. |
+| `Client.highlightDefinition` | Pass an `Lsp.Location` to `client.sourceExcerpt languageId`. For a `DefinitionTarget` named `target`, pass `{ uri := target.uri, range := target.range }`. |
+| `Client.sourceDefinition` | Call `client.symbolSource languageId name` with an optional container for the source excerpt at the indexed range. |
+| `HighlightedDefinition` | Both excerpt helpers return `SourceExcerpt`, with `location`, `languageId`, and `pieces`. Regenerate saved values that used the old JSON shape. |
 
-An unavailable definition provider or empty definition reply now leaves
-`definition? = none`. The indexed range supplies the excerpt in that case.
-Use `document.definitions position` when you need every target the prover
-reports at a specific position. Missing token support gives a plain excerpt.
-Explicit `document.semanticTokens` requests still report unsupported operations.
+The workspace index determines the extent of a named excerpt. If an application
+needs Go to Definition, call `document.definitions position` at a known
+reference and select the target to display. Missing token support gives a
+plain excerpt. Explicit `document.semanticTokens` requests still report
+unsupported operations.

@@ -45,7 +45,8 @@ shutdown_seen = False
 source_uri = None
 target_uri = None
 token_mode = None
-definition_mode = None
+document_opens = 0
+definition_requests = 0
 documents = {}
 
 
@@ -66,8 +67,8 @@ def workspace_symbol(name, container, *, resolve=None):
     if container is not None:
         symbol["containerName"] = container
     if resolve is None:
-        location["range"] = {"start": {"line": 0, "character": 1 if container == "Other" else 0},
-                             "end": {"line": 0, "character": 19}}
+        location["range"] = {"start": {"line": 0, "character": 10 if container == "Other" else 9},
+                             "end": {"line": 0, "character": 26}}
     else:
         symbol["data"] = resolve
     return symbol
@@ -126,7 +127,6 @@ while True:
         source_uri = options.get("sourceUri")
         target_uri = options.get("targetUri")
         token_mode = options.get("tokenMode")
-        definition_mode = options.get("definitionMode")
         if mode == "workspace":
             assert params["capabilities"]["textDocument"]["semanticTokens"]["requests"]["range"] is True
             send({"method": "test/status", "params": {"ready": False}})
@@ -137,9 +137,9 @@ while True:
             "textDocumentSync": 2 if mode == "incremental" else 1,
             "hoverProvider": mode != "local-definition",
         }
-        if definition_mode != "absent":
-            capabilities["definitionProvider"] = (
-                {} if definition_mode == "identifier-only" else definition_mode != "disabled")
+        definition_provider = options.get("definitionProvider", True)
+        if definition_provider is not None:
+            capabilities["definitionProvider"] = definition_provider
         if mode == "workspace":
             capabilities["workspaceSymbolProvider"] = {"resolveProvider": True}
             if token_mode != "absent":
@@ -147,7 +147,7 @@ while True:
                     "full": token_mode not in ("range", "none"),
                     "range": token_mode not in ("full", "none"),
                     "legend": {
-                        "tokenTypes": ["keyword", "function", "number"],
+                        "tokenTypes": ["type", "function"],
                         "tokenModifiers": ["declaration"],
                     },
                 }
@@ -200,33 +200,23 @@ while True:
         reply(request_id, [{"targetUri": params["textDocument"]["uri"],
                             "targetRange": {"start": start, "end": {"line": 1, "character": 0}},
                             "targetSelectionRange": {"start": start, "end": {"line": 0, "character": end}}}])
-    elif method == "textDocument/definition":
-        assert definition_mode not in ("absent", "disabled")
-        if definition_mode == "identifier-only" and params["position"] != {"line": 0, "character": 7}:
-            assert params["position"] == {"line": 0, "character": 0}
-            reply(request_id, None)
-            continue
-        if definition_mode == "empty":
-            reply(request_id, [])
-            continue
-        if definition_mode == "disconnect":
-            sys.exit(0)
-        if definition_mode == "deadline":
-            continue
-        if definition_mode == "server-error":
-            send({"id": request_id, "error": {"code": -32601, "message": "feature unavailable"}})
-            continue
-        if definition_mode == "protocol":
-            reply(request_id, [{"targetUri": target_uri}])
-            continue
-        target = {"targetUri": target_uri,
-                  "targetRange": {"start": {"line": 0, "character": 2},
-                                  "end": {"line": 0, "character": 20}},
-                  "targetSelectionRange": {"start": {"line": 0, "character": 5},
-                                           "end": {"line": 0, "character": 12}},
-                  "originSelectionRange": {"start": {"line": 0, "character": 7},
-                                           "end": {"line": 0, "character": 14}}}
-        reply(request_id, [target, target] if definition_mode == "multiple" else [target])
+    elif method == "textDocument/definition" and mode == "workspace":
+        definition_requests += 1
+        assert params["textDocument"]["uri"] == source_uri, params
+        if params["position"] == {"line": 0, "character": 9}:
+            reply(request_id, [{"targetUri": target_uri,
+                               "targetRange": {"start": {"line": 0, "character": 0},
+                                               "end": {"line": 0, "character": 17}},
+                               "targetSelectionRange": {"start": {"line": 0, "character": 7},
+                                                        "end": {"line": 0, "character": 13}},
+                               "originSelectionRange": {"start": {"line": 0, "character": 9},
+                                                        "end": {"line": 0, "character": 15}}}])
+        else:
+            assert params["position"] == {"line": 0, "character": 16}, params
+            reply(request_id, [{"uri": target_uri,
+                               "range": {"start": {"line": line, "character": 7},
+                                         "end": {"line": line, "character": 14}}}
+                              for line in (1, 2)])
     elif method in ("textDocument/semanticTokens/full", "textDocument/semanticTokens/range"):
         if hold_next_token:
             hold_next_token = False
@@ -246,9 +236,10 @@ while True:
         assert token_mode not in ("absent", "none")
         assert token_mode != "range" or method.endswith("/range")
         assert token_mode != "full" or method.endswith("/full")
-        reply(request_id, None if token_mode == "null" else {
-            "data": [0, 2, 2, 0, 0, 0, 3, 7, 1, 1, 0, 12, 1, 2, 0]})
+        data = [] if params["textDocument"]["uri"] == target_uri else [0, 9, 6, 0, 0, 0, 7, 7, 1, 1]
+        reply(request_id, None if token_mode == "null" else {"data": data})
     elif method == "textDocument/didOpen":
+        document_opens += 1
         document = params["textDocument"]
         if mode == "incremental":
             documents[document["uri"]] = document["text"]
@@ -271,6 +262,8 @@ while True:
         del documents[params["textDocument"]["uri"]]
     elif method == "test/document-text":
         reply(request_id, documents[params["textDocument"]["uri"]])
+    elif method == "test/workspace-traffic":
+        reply(request_id, {"documentOpens": document_opens, "definitionRequests": definition_requests})
     elif method == "test/readiness":
         send({"method": "test/status", "params": {"ready": False}})
         for _ in range(600):

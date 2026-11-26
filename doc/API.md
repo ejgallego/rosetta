@@ -61,41 +61,33 @@ The following call reads a Rust method after the server has indexed the project.
 client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")
 ```
 
-The result contains the exact source `pieces`, their `languageId`, and the
-lookup information used to choose the excerpt.
+The result is a `SourceExcerpt` containing the indexed `location`, the requested
+`languageId`, and the text `pieces`. The server chooses the
+range. An index entry spanning `MyType measure();` yields that declaration.
+An entry spanning only `measure` yields only the name.
 
-- `symbolLocation : Lsp.Location` is the unique matching location from
-  `workspace/symbol`. Rosetta sends the name as the query and filters the
-  candidates by exact name and, when supplied, exact `containerName`.
-  It resolves missing ranges only for matching candidates. Duplicate hits at
-  the same URI and range count as one location. The container is the string
-  reported by the server. Callers choose how to parse qualified names.
-- `definition? : Option DefinitionTarget` holds the single target returned by
-  `textDocument/definition` at the start of the indexed range. A
-  `LocationLink` preserves the target's full range and selection range. If
-  definition support is absent or disabled, Rosetta skips the request. A
-  skipped request and a reply of `null` or `[]` both produce `none`.
+Use `client.lookupSymbol "compress" (container? := some "EdwardsPoint")`
+for the `Lsp.Location` alone. Rosetta sends the name to `workspace/symbol`
+and filters candidates by exact name and optional server-reported
+`containerName`. It requests `workspaceSymbol/resolve` only for matching
+candidates with a deferred range. Duplicate hits at the same URI and range
+count as one location. Omitting the container searches across all containers.
+Lookup works on the index alone, including for an unopened non-file URI.
+For all search candidates, use `client.workspaceSymbols query`.
 
-For example, the symbol range for `pub fn measure() {}` might start on
-`pub`, where a definition request can return no target. Rosetta then uses
-the indexed range for the excerpt. When the prover supplies a definition,
-Rosetta uses its target range, which can be in another file. The prover
-determines how much source the excerpt covers.
-
-Use `client.lookupSymbol languageId name (container? := some container)` for
-the locations alone. Its `SymbolLookup.displayLocation` accessor selects the
-same location that `symbolSource` uses. With definition support disabled,
-the lookup can return the indexed location without opening the document.
-For a list of search results, `client.workspaceSymbols query` returns all
-candidates with resolved locations. For Go to Definition at a known position,
-`document.definitions position` returns the prover's targets, including an
-empty array or several targets.
+For Go to Definition, call `document.definitions position` with the position
+of the reference you want to follow. In `MyType measure();`, asking at the
+start of the declaration can take you to the definition of `MyType`. Named
+lookup therefore uses only the indexed location. The direct definition request
+returns all targets from the server, including an empty array or several targets.
 
 Use `client.sourceExcerpt languageId location` to read any `Lsp.Location`.
 When the document is open, Rosetta borrows its current overlay and checks
-that the language matches. Otherwise it reads the file and opens a temporary
-document. A non-file URI needs an open overlay. A concurrent edit or close
-that invalidates a borrowed version is reported at scope release.
+that the language matches. A workspace symbol range carries no document
+version, so an edit since indexing can change the text at that range. For an
+unopened file, Rosetta reads it from disk and opens a temporary document. A
+non-file URI needs an open overlay. A concurrent edit or close that invalidates
+a borrowed version is reported at scope release.
 
 Concatenating `pieces` reproduces the selected source text, including Unicode
 and CRLF. Rosetta requests range tokens when available and otherwise uses full
@@ -104,10 +96,10 @@ support or a null token result yields plain text. A caller explicitly requesting
 tokens with `document.semanticTokens range?` receives `ClientError.unsupported`
 when the requested operation is unavailable.
 
-Named lookup reports `ClientError.invalidInput` for an empty name or supplied
-empty container, zero or several distinct matching locations, or several
-definition targets. Malformed replies, server errors, timeouts, disconnections,
-and source-reading failures propagate to the caller.
+Named lookup reports `ClientError.invalidInput` if the name or supplied
+container is empty, or if the server returns zero or several distinct matching
+locations. Malformed replies, server errors, timeouts, disconnections, and
+source-reading failures propagate to the caller.
 
 Initialization options remain caller-owned. For example, rust-analyzer needs
 `workspace.symbol.search.kind = "all_symbols"` to include methods. Workspace
@@ -196,8 +188,8 @@ There are four distinct operations:
 - `lspCode` records authored source to analyze in a registered context.
 - `lspRef` queries an expression in that context's composed scope, using the
   profile's language-specific wrapper. It does not search a workspace index.
-- `lookupSymbol` finds a unique indexed location and records any definition the
-  prover supplies at the start of that range.
+- `lookupSymbol` finds a unique indexed location for an exact symbol name and
+  optional container.
 - `sourceExcerpt` presents an existing source range, using an open overlay when
   available. `symbolSource` combines lookup and excerpt in one call.
 

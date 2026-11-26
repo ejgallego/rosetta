@@ -603,20 +603,18 @@ private def probe (language command root : String) : EIO ClientError Unit := do
 private def assertCheck (condition : Bool) (message : String) : EIO ClientError Unit :=
   unless condition do throw <| ClientError.invalidInput message
 
-/-- A workspace result in one file resolves into a differently located definition.
-Unicode and CRLF exercise token slicing without using any Rust-specific syntax. -/
+/-- The indexed declaration starts at a return type whose definition is in another file.
+The preceding Unicode comment and the CRLF terminator exercise exact source slicing. -/
 def workspaceChecks (server : String) : EIO ClientError Unit :=
   IO.FS.withTempFile fun indexHandle indexFile => IO.FS.withTempFile fun targetHandle targetFile => do
-    let symbolText := "pub fn measure() {}\n"
-    let targetText := "😀fn measure() { 1 }\r\n"
+    let symbolText := "/* 😀 */ MyType measure();\r\n"
     indexHandle.putStr symbolText
     indexHandle.flush
-    targetHandle.putStr targetText
+    targetHandle.putStr "struct MyType {};\nMyType measure();\nMyType measure(int);\n"
     targetHandle.flush
     let sourceUri := (System.Uri.pathToUri indexFile : String)
     let targetUri := (System.Uri.pathToUri targetFile : String)
-    let indexedRange := range 0 0 0 19
-    let targetRange := range 0 2 0 20
+    let indexedLocation : Lsp.Location := { uri := sourceUri, range := range 0 9 0 26 }
     let container := some "Container"
     let workspaceConfig (uri : String) (options : List (String × Json)) : ClientConfig := {
         command := "python3", args := #[server], root := "."
@@ -627,96 +625,107 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       assertCheck ((← client.latestNotification "test/status").any (fun params =>
         (params.getObjValAs? Bool "ready").toOption == some false))
         "notification sent during initialization was lost"
-      let source ← client.symbolSource "test-language" "measure" container
-      assertCheck (source.symbolLocation.uri == sourceUri && source.symbolLocation.range == indexedRange)
-        "following the definition lost the indexed symbol location"
-      let some definition := source.definition?
-        | throw <| ClientError.invalidInput "workspace symbol lost its definition target"
-      assertCheck (definition.uri == targetUri && definition.range == targetRange &&
-        definition.selectionRange == range 0 5 0 12 &&
-        definition.originSelectionRange? == some (range 0 7 0 14)) "definition LocationLink ranges were ignored"
-      let displayLocation := source.toSymbolLookup.displayLocation
-      assertCheck (displayLocation.uri == targetUri && displayLocation.range == targetRange)
-        "display location did not select the full definition range"
-      assertCheck (source.languageId == "test-language" &&
-        String.join (source.pieces.toList.map HighlightedPiece.text) == "fn measure() { 1 }")
-        "source slice did not preserve the exact definition range"
-      assertCheck (source.pieces.any (fun piece => piece.tokenType == "function" &&
-          piece.text == "measure" && piece.modifiers == #["declaration"])) "semantic coloring was lost"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" "missing")
+      let location ← client.lookupSymbol "measure" container
+      assertCheck (location == indexedLocation) "lookup did not return the indexed location"
+      assertCheck (← failsWith (client.lookupSymbol "missing")
         (fun error => error matches .invalidInput _)) "lookup accepted a missing symbol"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" "measure")
+      assertCheck (← failsWith (client.lookupSymbol "measure")
         (fun error => error matches .invalidInput _)) "unqualified lookup accepted ambiguous addresses"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" "" container)
+      assertCheck (← failsWith (client.lookupSymbol "" container)
         (fun error => error matches .invalidInput _)) "lookup accepted an empty symbol name"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" "empty-container" (some ""))
+      assertCheck (← failsWith (client.lookupSymbol "empty-container" (some ""))
         (fun error => error matches .invalidInput _)) "lookup accepted an empty supplied container"
-      let literal ← client.lookupSymbol "test-language" " literal::measure " (some " Parent::Container ")
-      assertCheck (literal.symbolLocation.uri == sourceUri && literal.symbolLocation.range == indexedRange)
-        "lookup did not use the literal symbol name and container"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" " literal::measure " (some "Parent::Container"))
+      let literal ← client.lookupSymbol " literal::measure " (some " Parent::Container ")
+      assertCheck (literal == indexedLocation) "lookup did not use the literal symbol name and container"
+      assertCheck (← failsWith (client.lookupSymbol " literal::measure " (some "Parent::Container"))
         (fun error => error matches .invalidInput _)) "lookup accepted a different container spelling"
       let raw ← client.workspaceSymbols "raw-defer"
       assertCheck (raw.size == 1 && (raw[0]?).any (fun symbol =>
         symbol.name == "raw-deferred" && symbol.containerName?.isNone &&
           symbol.location.uri == sourceUri && symbol.location.range == range 0 0 0 5))
         "raw workspace search filtered or failed to resolve a fuzzy candidate"
-      let deferred ← client.lookupSymbol "test-language" "deferred" container
-      assertCheck (deferred.symbolLocation.uri == sourceUri && deferred.symbolLocation.range == range 0 0 0 5)
+      let deferred ← client.lookupSymbol "deferred" container
+      assertCheck (deferred.uri == sourceUri && deferred.range == range 0 0 0 5)
         "lookup did not resolve the deferred exact match amid irrelevant candidates"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" "deferred" (some "Other"))
+      assertCheck (← failsWith (client.lookupSymbol "deferred" (some "Other"))
         (fun error => error matches .protocol _)) "lookup hid a malformed resolution for a matching symbol"
-      assertCheck (← failsWith (client.lookupSymbol "test-language" "deferredMore" container)
+      assertCheck (← failsWith (client.lookupSymbol "deferredMore" container)
         (fun error => error matches .server (-32097) _ _)) "lookup hid a server error for a matching symbol"
       for name in #["bad-name", "bad-container"] do
-        assertCheck (← failsWith (client.lookupSymbol "test-language" name container)
+        assertCheck (← failsWith (client.lookupSymbol name container)
           (fun error => error matches .protocol _)) s!"lookup hid an invalid workspace symbol identity: {name}"
       for name in #["bad-uri", "bad-range"] do
-        assertCheck (← failsWith (client.lookupSymbol "test-language" name container)
+        assertCheck (← failsWith (client.lookupSymbol name container)
           (fun error => error matches .protocol _)) s!"lookup hid an invalid workspace symbol location: {name}"
-      let indexOverlay ← client.openDocument sourceUri "another-language" symbolText
-      check (← failsWith (client.lookupSymbol "test-language" "measure" container)
-        (fun error => error matches .invalidInput "cannot change a borrowed document language"))
-        "workspace lookup accepted an overlay with a different language"
-      indexOverlay.close
+      let traffic ← client.request "test/workspace-traffic" .null
+      assertCheck (traffic == Json.mkObj [("documentOpens", toJson 0), ("definitionRequests", toJson 0)])
+        s!"workspace lookup sent document traffic: {traffic}"
+      let source ← client.symbolSource "test-language" "measure" container
+      let excerpt ← client.sourceExcerpt "test-language" indexedLocation
+      assertCheck (toJson source == toJson excerpt) "symbol source differed from the excerpt at the indexed location"
+      assertCheck (source.location == indexedLocation && source.languageId == "test-language" &&
+        String.join (source.pieces.toList.map HighlightedPiece.text) == "MyType measure();")
+        "symbol source did not preserve the indexed declaration"
+      assertCheck (source.pieces.any (fun piece => piece.tokenType == "function" &&
+          piece.text == "measure" && piece.modifiers == #["declaration"])) "semantic coloring was lost"
+      assertCheck ((← client.document? sourceUri).isNone) "reading the indexed source left its document open"
+      let traffic ← client.request "test/workspace-traffic" .null
+      assertCheck ((traffic.getObjValAs? Nat "definitionRequests").toOption == some 0)
+        s!"reading source sent a definition request: {traffic}"
+      client.withDocument sourceUri "test-language" symbolText fun document => do
+        let #[definition] ← document.definitions indexedLocation.range.start
+          | throw <| ClientError.invalidInput "explicit navigation lost the type definition target"
+        assertCheck (definition.uri == targetUri && definition.range == range 0 0 0 17 &&
+          definition.selectionRange == range 0 7 0 13 &&
+          definition.originSelectionRange? == some (range 0 9 0 15)) "type definition link ranges were ignored"
+        let typeSource ← client.sourceExcerpt "test-language" { uri := definition.uri, range := definition.range }
+        assertCheck (String.join (typeSource.pieces.toList.map HighlightedPiece.text) == "struct MyType {};")
+          "explicit navigation did not lead to the type declaration"
+        let #[first, second] ← document.definitions ⟨0, 16⟩
+          | throw <| ClientError.invalidInput "explicit navigation lost multiple definition targets"
+        assertCheck (first.uri == targetUri && first.range == range 1 7 1 14 &&
+          second.uri == targetUri && second.range == range 2 7 2 14)
+          "explicit navigation changed the locations of the overloaded declarations"
       -- Workspace helpers must prefer an admitted overlay and borrow it.
-      let overlayText := "😀fn measure() { 2 }\r\n"
-      let overlay ← client.openDocument targetUri "test-language" overlayText
-      check (← failsWith (client.sourceExcerpt "another-language" displayLocation)
+      let overlayText := "/* 😀 */ MyType collect();\r\n"
+      let overlay ← client.openDocument sourceUri "test-language" overlayText
+      assertCheck ((← client.lookupSymbol "measure" container) == indexedLocation)
+        "workspace lookup depended on the overlay contents"
+      check (← failsWith (client.symbolSource "another-language" "measure" container)
         (fun error => error matches .invalidInput "cannot change a borrowed document language"))
         "source highlighting accepted an overlay with a different language"
-      let overlaid ← client.sourceExcerpt "test-language" displayLocation
-      assertCheck (String.join (overlaid.pieces.toList.map HighlightedPiece.text) == "fn measure() { 2 }")
+      let overlaid ← client.symbolSource "test-language" "measure" container
+      assertCheck (String.join (overlaid.pieces.toList.map HighlightedPiece.text) == "MyType collect();")
         "workspace helper ignored the open overlay"
       assertCheck ((← overlay.text) == overlayText) "workspace helper closed a borrowed document"
-      let borrowed ← client.withDocument targetUri "test-language" overlayText fun document => pure document.version
+      let borrowed ← client.withDocument sourceUri "test-language" overlayText fun document => pure document.version
       assertCheck (borrowed == overlay.version) "identical overlay was reopened"
-      let mismatch ← (client.withDocument targetUri "test-language" "other" fun _ => pure ()).toBaseIO
+      let mismatch ← (client.withDocument sourceUri "test-language" "other" fun _ => pure ()).toBaseIO
       assertCheck (match mismatch with | .error (.invalidInput _) => true | _ => false)
         "scoped helper replaced a borrowed overlay"
-      check (← failsWith (client.withDocument targetUri "another-language" overlayText fun _ => pure ())
+      check (← failsWith (client.withDocument sourceUri "another-language" overlayText fun _ => pure ())
         (fun error => error matches .invalidInput "cannot change a borrowed document language"))
         "scoped helper accepted identical text with a different language"
       client.notify "test/hold-next-token" .null
-      let highlighting ← EIO.asTask (client.sourceExcerpt "test-language" displayLocation) .dedicated
+      let highlighting ← EIO.asTask (client.symbolSource "test-language" "measure" container) .dedicated
       awaitNotification client "test/held-highlight"
       let edited ← overlay.change overlayText
       let stale ← IO.wait highlighting
       assertCheck (match stale with
         | .error (.documentCleanup uri (.staleDocument _ expected actual?)
             (some (.staleDocument ..))) =>
-          uri == targetUri && expected == overlay.version && actual? == some edited.version
+          uri == sourceUri && expected == overlay.version && actual? == some edited.version
         | _ => false) "workspace highlighting failed to release the stale borrowed version"
       discard <| client.request "test/release-document" .null
-      check (← failsWith (client.withDocument targetUri "another-language" overlayText fun _ => pure ())
+      check (← failsWith (client.withDocument sourceUri "another-language" overlayText fun _ => pure ())
         (fun error => error matches .invalidInput "cannot change a borrowed document language"))
         "editing an overlay lost its admitted language"
-      client.withDocument targetUri "test-language" overlayText fun document =>
+      client.withDocument sourceUri "test-language" overlayText fun document =>
         assertCheck (document.version == edited.version) "scoped helper failed to borrow the edited version"
       edited.close
-      client.withDocument targetUri "test-language" overlayText fun _ => pure ()
-      assertCheck ((← client.document? targetUri).isNone) "owned scoped document was not closed"
-      let doubleFailure ← (client.withDocument targetUri "test-language" overlayText fun document => do
+      client.withDocument sourceUri "test-language" overlayText fun _ => pure ()
+      assertCheck ((← client.document? sourceUri).isNone) "owned scoped document was not closed"
+      let doubleFailure ← (client.withDocument sourceUri "test-language" overlayText fun document => do
         document.close
         throw (α := Unit) <| ClientError.invalidInput "action failed").toBaseIO
       assertCheck (match doubleFailure with
@@ -724,15 +733,15 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
         | _ => false) "document release erased the primary error"
       for edit in #[false, true] do
         for failAction in #[false, true] do
-          let owner ← client.openDocument targetUri "test-language" overlayText
-          let result ← (client.withDocument targetUri "test-language" overlayText fun borrowed => do
+          let owner ← client.openDocument sourceUri "test-language" overlayText
+          let result ← (client.withDocument sourceUri "test-language" overlayText fun borrowed => do
             if edit then discard <| borrowed.change "changed overlay" else borrowed.close
             if failAction then throw (α := Unit) <| ClientError.invalidInput "borrowed action failed"
             ).toBaseIO
-          let current? ← client.document? targetUri
+          let current? ← client.document? sourceUri
           assertCheck (match result with
             | .error (.documentCleanup uri (.staleDocument _ expected actual?) original?) =>
-              uri == targetUri && expected == owner.version && actual? == current?.map (·.version) &&
+              uri == sourceUri && expected == owner.version && actual? == current?.map (·.version) &&
               (if failAction then original? matches some (.invalidInput "borrowed action failed")
                else original?.isNone)
             | _ => false) "borrowed release lost version invalidation or the primary error"
@@ -741,19 +750,24 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
             assertCheck ((← current.text) == "changed overlay") "borrowed release changed owner's overlay"
             current.close
           else assertCheck current?.isNone "borrowed release reopened a closed document"
-      let owner ← client.openDocument targetUri "test-language" overlayText
-      let failedBorrow ← (client.withDocument targetUri "test-language" overlayText fun _ =>
+      let owner ← client.openDocument sourceUri "test-language" overlayText
+      let failedBorrow ← (client.withDocument sourceUri "test-language" overlayText fun _ =>
         throw (α := Unit) <| ClientError.invalidInput "borrowed action failed").toBaseIO
       assertCheck (failedBorrow matches .error (.invalidInput "borrowed action failed"))
         "successful borrowed release changed the primary error"
       assertCheck ((← owner.text) == overlayText) "borrowed release closed the owner's valid overlay"
       owner.close
-      let clipped ← client.sourceExcerpt "test-language" { displayLocation with range := range 0 3 0 10 }
-      assertCheck (String.join (clipped.pieces.toList.map HighlightedPiece.text) == "n measu")
-        "tokens intersecting source boundaries were discarded"
-      let multiline ← client.sourceExcerpt "test-language" { displayLocation with range := range 0 2 1 0 }
-      assertCheck (String.join (multiline.pieces.toList.map HighlightedPiece.text) == "fn measure() { 1 }\r\n")
-        "source slice lost its CRLF terminator"
+      let clipped ← client.sourceExcerpt "test-language" { indexedLocation with range := range 0 10 0 17 }
+      assertCheck (String.join (clipped.pieces.toList.map HighlightedPiece.text) == "yType m" &&
+        clipped.pieces.any (fun piece => piece.text == "yType" && piece.tokenType == "type") &&
+        clipped.pieces.any (fun piece => piece.text == "m" && piece.tokenType == "function"))
+        "clipping an excerpt lost text or semantic coloring at a source boundary"
+      let multiline ← client.sourceExcerpt "test-language" { indexedLocation with range := range 0 0 1 0 }
+      assertCheck (String.join (multiline.pieces.toList.map HighlightedPiece.text) == symbolText)
+        "source slice lost Unicode or its CRLF terminator"
+      let traffic ← client.request "test/workspace-traffic" .null
+      assertCheck ((traffic.getObjValAs? Nat "definitionRequests").toOption == some 2)
+        s!"workspace helpers sent additional definition requests: {traffic}"
       discard <| client.request "test/readiness" (Json.mkObj [])
       client.waitForNotification "test/status" (fun params =>
         (params.getObjValAs? Bool "ready").toOption == some true) 1000
@@ -775,86 +789,71 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       let unconfigured ← (client.waitForNotification "unconfigured/status" (fun _ => true) 0).toBaseIO
       assertCheck (match unconfigured with | .error (.invalidInput _) => true | _ => false)
         "readiness wait accepted an unconfigured notification method"
-      IO.println "Workspace lookup, definition following, ambiguity and Unicode highlighting passed"
-    for definitionMode in #["identifier-only", "empty", "absent", "disabled"] do
-      let uri := if definitionMode == "disabled" then "untitled:workspace-symbol" else sourceUri
+      IO.println "Indexed workspace source, explicit definitions, and Unicode highlighting passed"
+    let uri := "untitled:workspace-symbol"
+    let virtualLocation := { indexedLocation with uri }
+    for definitionProvider in #[Json.bool true, Json.bool false, Json.null] do
       Client.withSession (workspaceConfig uri [
-          ("definitionMode", toJson definitionMode), ("tokenMode", "none")]) fun client => do
-        -- The symbol range begins at the modifier. Only the identifier resolves.
-        if definitionMode == "identifier-only" then
-          client.withDocument uri "test-language" symbolText fun document => do
-            assertCheck ((← document.definitions ⟨0, 0⟩).isEmpty) "modifier position unexpectedly resolved"
-            assertCheck ((← document.definitions ⟨0, 7⟩).size == 1) "identifier position did not resolve"
+          ("definitionProvider", definitionProvider), ("tokenMode", "none")]) fun client => do
+        assertCheck ((← client.lookupSymbol "measure" container) == virtualLocation)
+          s!"lookup could not return an unopened virtual symbol with definition provider {definitionProvider}"
         let readSource := client.symbolSource "test-language" "measure" container
-        let source ← if definitionMode == "disabled" then do
-            let lookup ← client.lookupSymbol "test-language" "measure" container
-            assertCheck (lookup.definition?.isNone && lookup.displayLocation.uri == uri &&
-              lookup.displayLocation.range == indexedRange) "workspace lookup could not return an unopened symbol"
-            assertCheck (← failsWith readSource (fun error => error matches .unsupported _))
-              "the source helper hid the unsupported URI"
-            let overlay ← client.openDocument uri "test-language" symbolText
-            assertCheck (← failsWith (client.symbolSource "another-language" "measure" container)
-              (fun error => error matches .invalidInput "cannot change a borrowed document language"))
-              "plain source fallback accepted an overlay with a different language"
-            let source ← readSource
-            assertCheck ((← overlay.text) == symbolText) "plain source fallback closed the overlay"
-            overlay.close
-            pure source
-          else readSource
-        let displayLocation := source.toSymbolLookup.displayLocation
-        assertCheck (source.definition?.isNone && source.symbolLocation.uri == uri &&
-          source.symbolLocation.range == indexedRange &&
-          displayLocation.uri == uri && displayLocation.range == indexedRange)
-          s!"{definitionMode}: unique workspace symbol fallback was lost"
-        assertCheck (source.pieces.size == 1 &&
-          source.pieces[0]!.text == "pub fn measure() {}" &&
+        assertCheck (← failsWith readSource (fun error => error matches .unsupported _))
+          "the source helper hid the unsupported URI"
+        let traffic ← client.request "test/workspace-traffic" .null
+        assertCheck (traffic == Json.mkObj [("documentOpens", toJson 0), ("definitionRequests", toJson 0)])
+          s!"an unopened virtual symbol sent document traffic: {traffic}"
+        let overlay ← client.openDocument uri "test-language" symbolText
+        let source ← readSource
+        assertCheck (source.location == virtualLocation && source.pieces.size == 1 &&
+          source.pieces[0]!.text == "MyType measure();" &&
           source.pieces[0]!.tokenType.isEmpty && source.pieces[0]!.modifiers.isEmpty)
-          s!"{definitionMode}: fallback source was not preserved uncolored"
-        assertCheck ((← client.document? uri).isNone) "fallback source document remained open"
+          "the source helper lost the plain text of the virtual overlay"
+        assertCheck ((← overlay.text) == symbolText) "reading a virtual symbol closed its overlay"
+        overlay.close
+        let traffic ← client.request "test/workspace-traffic" .null
+        assertCheck (traffic == Json.mkObj [("documentOpens", toJson 1), ("definitionRequests", toJson 0)])
+          s!"reading a virtual symbol sent unexpected document traffic: {traffic}"
     for tokenMode in #["range", "full", "null", "none", "absent"] do
       Client.withSession (workspaceConfig sourceUri [("tokenMode", toJson tokenMode)]) fun client => do
         assertCheck ((← client.latestNotification "test/status").isNone)
           "retained state leaked into another session"
         let source ← client.symbolSource "test-language" "measure" container
-        assertCheck (String.join (source.pieces.toList.map HighlightedPiece.text) == "fn measure() { 1 }")
+        assertCheck (String.join (source.pieces.toList.map HighlightedPiece.text) == "MyType measure();")
           s!"{tokenMode}: source slice changed"
         assertCheck ((source.pieces.any (fun piece => piece.tokenType == "function")) ==
           (tokenMode == "range" || tokenMode == "full")) s!"{tokenMode}: token result was mishandled"
         if tokenMode == "none" || tokenMode == "absent" then
           let wholeRange := range 0 0 1 0
-          let plain ← client.sourceExcerpt "test-language" { uri := targetUri, range := wholeRange }
-          assertCheck (plain.pieces.size == 1 && plain.pieces[0]!.text == targetText &&
+          let plain ← client.sourceExcerpt "test-language" { indexedLocation with range := wholeRange }
+          assertCheck (plain.pieces.size == 1 && plain.pieces[0]!.text == symbolText &&
             plain.pieces[0]!.tokenType.isEmpty && plain.pieces[0]!.modifiers.isEmpty)
             "unsupported tokens changed Unicode or CRLF in the exact excerpt"
           assertCheck (← failsWith (client.sourceExcerpt "test-language" {
-            uri := targetUri, range := range 0 100 0 101 }) (fun error => error matches .protocol _))
+            indexedLocation with range := range 0 100 0 101 }) (fun error => error matches .protocol _))
             "unsupported tokens hid an invalid source range"
-          client.withDocument targetUri "test-language" targetText fun document => do
+          client.withDocument sourceUri "test-language" symbolText fun document => do
             assertCheck (← failsWith (document.semanticTokens (some wholeRange))
               (fun error => error matches .unsupported _)) "the direct token request lost its capability error"
         if tokenMode == "range" then
-          client.withDocument targetUri "test-language" targetText fun document => do
+          client.withDocument sourceUri "test-language" symbolText fun document => do
             assertCheck (← failsWith document.semanticTokens (fun error => error matches .unsupported _))
               "range-only server received a full-document request"
-    for feature in #["definitionMode", "tokenMode"] do
-      let modes := #["server-error", "disconnect", "protocol", "deadline"]
-      let modes := if feature == "definitionMode" then modes.push "multiple" else modes
-      for failureMode in modes do
-        Client.withSession { workspaceConfig sourceUri [(feature, toJson failureMode)] with
-            timeoutMs := 1000 } fun client => do
-          let result ← (client.symbolSource "test-language" "measure" container).toBaseIO
-          let detail := match result with | .ok _ => "success" | .error error => toString error
-          assertCheck (match result with
-            | .error error =>
-              match failureMode, error with
-              | "server-error", .server (-32601) _ _ => true
-              | "disconnect", .documentCleanup _ .disconnected (some .disconnected) => true
-              | "protocol", .protocol _ => true
-              | "deadline", .deadline _ => true
-              | "multiple", .invalidInput _ => true
-              | _, _ => false
-            | .ok _ => false) s!"{feature}: fallback erased {failureMode}: {detail}"
-    IO.println "Workspace fallback, semantic token negotiation and typed failures passed"
+    for failureMode in #["server-error", "disconnect", "protocol", "deadline"] do
+      Client.withSession { workspaceConfig sourceUri [("tokenMode", toJson failureMode)] with
+          timeoutMs := 1000 } fun client => do
+        let result ← (client.symbolSource "test-language" "measure" container).toBaseIO
+        let detail := match result with | .ok _ => "success" | .error error => toString error
+        assertCheck (match result with
+          | .error error =>
+            match failureMode, error with
+            | "server-error", .server (-32601) _ _ => true
+            | "disconnect", .documentCleanup _ .disconnected (some .disconnected) => true
+            | "protocol", .protocol _ => true
+            | "deadline", .deadline _ => true
+            | _, _ => false
+          | .ok _ => false) s!"symbol source lost the {failureMode} token error: {detail}"
+    IO.println "Virtual overlays, semantic token negotiation, and typed failures passed"
 
 def main (args : List String) : IO Unit := do
   match args with

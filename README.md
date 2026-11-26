@@ -60,10 +60,10 @@ rosetta`. For local development, replace the Git dependency with
 Then use `import Rosetta`. The main generator operation is
 `Rosetta.analyze : Array ContextProfile → Array Request → EIO ClientError Bundle`.
 For a named symbol, `client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")`
-returns its source excerpt, its indexed location, and any definition the prover
-supplied at the start of that location. The excerpt uses the definition range
-when available and the indexed range otherwise. Semantic tokens add coloring
-when supported. The caller configures the server and waits for indexing as needed.
+returns the location from the workspace index and the text in that exact range.
+Some servers index just the name. To follow a reference at a known position,
+use `document.definitions position`. Semantic tokens add coloring when supported.
+The caller configures the server and waits for indexing as needed.
 Use `ClientConfig.retainedNotificationMethods` and `Client.latestNotification`
 when a loading-state update must survive eviction from the notification journal.
 
