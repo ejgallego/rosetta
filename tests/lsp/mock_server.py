@@ -45,6 +45,7 @@ shutdown_seen = False
 source_uri = None
 target_uri = None
 token_mode = None
+expected_token_range = None
 document_opens = 0
 definition_requests = 0
 documents = {}
@@ -127,6 +128,7 @@ while True:
         source_uri = options.get("sourceUri")
         target_uri = options.get("targetUri")
         token_mode = options.get("tokenMode")
+        expected_token_range = options.get("expectedTokenRange")
         if mode == "workspace":
             assert params["capabilities"]["textDocument"]["semanticTokens"]["requests"]["range"] is True
             send({"method": "test/status", "params": {"ready": False}})
@@ -172,6 +174,16 @@ while True:
             reply(request_id, [workspace_symbol(query, "Container")])
         elif query == "empty-container":
             reply(request_id, [workspace_symbol(query, "")])
+        elif query == "reversed-location":
+            symbol = workspace_symbol(query, "Container")
+            location = symbol["location"]
+            position_range = location["range"]
+            position_range["start"], position_range["end"] = position_range["end"], position_range["start"]
+            reply(request_id, [symbol])
+        elif query in ("change-name", "change-kind", "change-container", "change-uri", "reverse-range"):
+            reply(request_id, [workspace_symbol(query, "Container", resolve=query)])
+        elif query == "complete-container":
+            reply(request_id, [workspace_symbol(query, None, resolve=query)])
         elif query == "bad-name":
             reply(request_id, [workspace_symbol(1, "Container"), workspace_symbol(query, "Container")])
         elif query == "bad-container":
@@ -187,12 +199,25 @@ while True:
         if params["data"] == "server-error":
             send({"id": request_id, "error": {"code": -32097, "message": "symbol resolution failed"}})
             continue
-        if params["data"] == "protocol":
-            params["location"]["range"] = "invalid"
+        start = {"line": 0, "character": 0}
+        end = {"line": 0, "character": 5}
+        change = params["data"]
+        position_range = {"start": start, "end": end}
+        if change == "protocol":
+            position_range = "invalid"
+        elif change == "change-name":
+            params["name"] += "Changed"
+        elif change == "change-kind":
+            params["kind"] = 5
+        elif change in ("change-container", "complete-container"):
+            params["containerName"] = "Other"
+        elif change == "change-uri":
+            params["location"]["uri"] = target_uri
+        elif change == "reverse-range":
+            position_range = {"start": end, "end": start}
         else:
-            assert params["data"] == "range"
-            params["location"]["range"] = {"start": {"line": 0, "character": 0},
-                                            "end": {"line": 0, "character": 5}}
+            assert change == "range"
+        params["location"]["range"] = position_range
         reply(request_id, params)
     elif method == "textDocument/definition" and mode == "local-definition":
         end = {1: 1, 2: 99}[params["position"]["line"]]
@@ -236,6 +261,8 @@ while True:
         assert token_mode not in ("absent", "none")
         assert token_mode != "range" or method.endswith("/range")
         assert token_mode != "full" or method.endswith("/full")
+        if expected_token_range is not None:
+            assert params["range"] == expected_token_range, params
         data = [] if params["textDocument"]["uri"] == target_uri else [0, 9, 6, 0, 0, 0, 7, 7, 1, 1]
         reply(request_id, None if token_mode == "null" else {"data": data})
     elif method == "textDocument/didOpen":

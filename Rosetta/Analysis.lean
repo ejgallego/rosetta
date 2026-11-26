@@ -39,7 +39,7 @@ private structure Placement where
 
 private def fullRange (text : String) : Lsp.Range := {
   start := ⟨0, 0⟩
-  «end» := (FileMap.ofString text).utf8PosToLspPos ⟨text.utf8ByteSize⟩ }
+  «end» := (SourceIndex.ofString text).endPosition }
 
 private def prepare (profile : ContextProfile) (requests : Array Request) :
     Except String (Projection × Array Placement) := do
@@ -111,7 +111,6 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
         let some request := requests.find? (·.key == location.uri)
           | throw <| ClientError.invalidInput "projection contains an unknown request"
         mappedDiagnostics := mappedDiagnostics.push (request.key, { diagnostic with range := location.range })
-    let fileMap := FileMap.ofString projection.text
     for placement in placements do
       let request := placement.request
       let mut spans := #[]
@@ -131,7 +130,8 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
         let offset := profile.referenceQueryOffset request.text
         unless offset < request.text.utf8ByteSize do
           throw <| ClientError.invalidInput "reference query offset is outside its text"
-        let position := fileMap.utf8PosToLspPos ⟨placement.bodyStart + offset⟩
+        let some position := projection.position? (placement.bodyStart + offset)
+          | throw <| ClientError.invalidInput "reference query offset is not an LSP character boundary"
         queries := queries.push (← query document caps projection position (fullRange request.text))
       else
         -- Bound eager hover/navigation work. No token support means plain code,
@@ -142,7 +142,8 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
           if queries.size ≥ 32 then break
           let some (start, _) := byteRange? request.text token.range
             | throw <| ClientError.invalidInput "invalid projected token"
-          let position := fileMap.utf8PosToLspPos ⟨placement.bodyStart + start⟩
+          let some position := projection.position? (placement.bodyStart + start)
+            | throw <| ClientError.invalidInput "invalid projected token start"
           queries := queries.push (← query document caps projection position token.range)
       snapshots := snapshots.push {
         request, languageId := profile.languageId, tokens := localTokens, queries

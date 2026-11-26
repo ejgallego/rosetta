@@ -396,21 +396,6 @@ def Client.openDocument (client : Client) (uri languageId text : String) : EIO C
     return version
   return { client, uri, version }
 
-/-- LSP counts CR, LF, and CRLF as line endings. -/
-private def documentEndPosition (text : String) : Lsp.Position := Id.run do
-  let mut line := 0
-  let mut character := 0
-  let mut afterCR := false
-  for c in text do
-    if c == '\r' || c == '\n' then
-      if c == '\r' || !afterCR then
-        line := line + 1
-      character := 0
-    else
-      character := character + c.utf16Size.toNat
-    afterCR := c == '\r'
-  return ⟨line, character⟩
-
 /-- Full replacement for full sync, a whole-document range for incremental sync.
 The returned handle supersedes the old version atomically with queue admission. -/
 def Document.change (document : Document) (text : String) : EIO ClientError Document := do
@@ -426,7 +411,7 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
     let doc ← checkedDocument s document.uri document.version
     let version := s.nextVersion
     let change := if kind == some 1 then Json.mkObj [("text", toJson text)] else
-      let oldRange : Lsp.Range := { start := ⟨0, 0⟩, «end» := documentEndPosition doc.text }
+      let oldRange : Lsp.Range := { start := ⟨0, 0⟩, «end» := (SourceIndex.ofString doc.text).endPosition }
       Json.mkObj [("range", toJson oldRange), ("text", toJson text)]
     let payload := notification "textDocument/didChange" <| some <| Json.mkObj [
       ("textDocument", Json.mkObj [("uri", toJson document.uri), ("version", toJson version)]),

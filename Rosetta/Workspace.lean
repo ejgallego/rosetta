@@ -3,6 +3,7 @@ Copyright (c) 2026 Lean FRO LLC. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 -/
 module
+import Rosetta.FileUri
 public import Rosetta.Client
 public section
 namespace Rosetta
@@ -14,19 +15,38 @@ private def Client.requestWorkspaceSymbols (client : Client) (query : String) :
   if result == .null then return #[]
   EIO.ofExcept <| result.getArr?.mapError ClientError.protocol
 
-private def Client.resolveWorkspaceSymbol (client : Client) (value : Json) :
-    EIO ClientError Lsp.SymbolInformation := do
-  let location ← EIO.ofExcept <| (value.getObjVal? "location").mapError ClientError.protocol
-  discard <| EIO.ofExcept <| (location.getObjValAs? Lsp.DocumentUri "uri").mapError ClientError.protocol
-  -- LSP WorkspaceSymbol may defer its location range until resolve.
-  let value ← if (location.getObjVal? "range").isOk then
-      pure value
-    else client.request "workspaceSymbol/resolve" value
-  let .obj _ := value | throw <| ClientError.protocol "expected a workspace symbol object"
+private def decodeWorkspaceSymbol (value : Json) : Except String Lsp.SymbolInformation := do
+  let .obj _ := value | throw "expected a workspace symbol object"
   -- LSP tags are optional; Lean's SymbolInformation decoder expects an array.
   let value := if value.getObjValD "tags" == .null then
       value.setObjVal! "tags" (.arr #[]) else value
-  EIO.ofExcept <| (fromJson? value).mapError ClientError.protocol
+  let symbol : Lsp.SymbolInformation ← fromJson? value
+  unless compare symbol.location.range.start symbol.location.range.end != .gt do
+    throw "workspace symbol location has a reversed range"
+  return symbol
+
+private def checkWorkspaceSymbolResolution (original : Json) (uri : Lsp.DocumentUri)
+    (resolved : Lsp.SymbolInformation) : Except String Unit := do
+  let name ← original.getObjValAs? String "name"
+  let kind ← original.getObjValAs? Lsp.SymbolKind "kind"
+  let container? ← original.getObjValAs? (Option String) "containerName"
+  unless resolved.name == name && resolved.kind == kind && resolved.location.uri == uri &&
+      container?.all (fun container => resolved.containerName? == some container) do
+    throw "workspace symbol resolution changed the symbol identity or URI"
+
+private def Client.resolveWorkspaceSymbol (client : Client) (value : Json) :
+    EIO ClientError Lsp.SymbolInformation := do
+  let location ← EIO.ofExcept <| (value.getObjVal? "location").mapError ClientError.protocol
+  if (location.getObjVal? "range").isOk then
+    return ← EIO.ofExcept <| (decodeWorkspaceSymbol value).mapError ClientError.protocol
+  -- LSP WorkspaceSymbol may defer its location range until resolve.
+  let uri ← EIO.ofExcept <| (location.getObjValAs? Lsp.DocumentUri "uri").mapError ClientError.protocol
+  let response ← client.request "workspaceSymbol/resolve" value
+  EIO.ofExcept <| (do
+    let resolved ← decodeWorkspaceSymbol response
+    checkWorkspaceSymbolResolution value uri resolved
+    return resolved
+    ).mapError ClientError.protocol
 
 /-- Search the workspace and resolve deferred locations in all returned candidates. -/
 def Client.workspaceSymbols (client : Client) (query : String) :
@@ -73,8 +93,8 @@ def Client.waitForNotification (client : Client) (method : String) (accept : Jso
     IO.sleep 20
 
 private def readSource (uri : String) : EIO ClientError String := do
-  let some file := System.Uri.fileUriToPath? uri
-    | throw <| ClientError.unsupported s!"reading non-file source URI: {uri}"
+  let some file := localFileUriPath? uri
+    | throw <| ClientError.unsupported s!"reading source without a local file path: {uri}"
   IO.FS.readFile file
 
 /-- Use a live overlay when available; only unopened files are read from disk. -/
@@ -84,14 +104,12 @@ private def withSourceDocument (client : Client) (uri languageId : String)
     return ← document.withBorrowed languageId action
   client.withDocument uri languageId (← readSource uri) action
 
-/-- Find a unique indexed location for an exact name and optional container. -/
-def Client.lookupSymbol (client : Client) (name : String)
-    (container? : Option String := none) : EIO ClientError Lsp.Location := do
+/-- Find distinct indexed locations for an exact name and optional container,
+in server order. The result can be empty or contain several locations. -/
+def Client.lookupSymbols (client : Client) (name : String)
+    (container? : Option String := none) : EIO ClientError (Array Lsp.Location) := do
   if name.isEmpty then throw <| ClientError.invalidInput "empty symbol name"
   if container?.any String.isEmpty then throw <| ClientError.invalidInput "empty symbol container"
-  let description := match container? with
-    | some container => s!"{name} in {container}"
-    | none => name
   let mut locations : Array Lsp.Location := #[]
   for value in ← client.requestWorkspaceSymbols name do
     -- Fuzzy hits may require resolution, so filter on the raw identity first.
@@ -102,13 +120,17 @@ def Client.lookupSymbol (client : Client) (name : String)
         (value.getObjValAs? (Option String) "containerName").mapError ClientError.protocol
       unless candidateContainer? == some container do continue
     let symbol ← client.resolveWorkspaceSymbol value
-    unless symbol.name == name && container?.all (fun container => symbol.containerName? == some container) do
-      throw <| ClientError.protocol "workspace symbol resolution changed the requested name or container"
     unless locations.contains symbol.location do
       locations := locations.push symbol.location
-  unless locations.size == 1 do
-    throw <| ClientError.invalidInput s!"Expected one workspace symbol for {description}, found {locations.size}"
-  return locations[0]!
+  return locations
+
+/-- Find the unique indexed location for an exact name and optional container. -/
+def Client.lookupSymbol (client : Client) (name : String)
+    (container? : Option String := none) : EIO ClientError Lsp.Location := do
+  let locations ← client.lookupSymbols name container?
+  if let #[location] := locations then return location
+  let description := container?.elim name (fun container => s!"{name} in {container}")
+  throw <| ClientError.invalidInput s!"Expected one workspace symbol for {description}, found {locations.size}"
 
 /-- A lossless source slice with optional LSP semantic coloring. -/
 structure HighlightedPiece where
@@ -130,9 +152,9 @@ def Client.sourceExcerpt (client : Client) (languageId : String) (location : Lsp
   withSourceDocument client location.uri languageId fun document => do
     let text ← document.text
     let index := SourceIndex.ofString text
-    let some (start, stop) := index.byteRange? location.range
+    let some (range, start, stop) := index.clampedByteRange? location.range
       | throw <| ClientError.protocol "invalid source range"
-    let spans ← try document.semanticTokens (some location.range) catch error =>
+    let spans ← try document.semanticTokens (some range) catch error =>
       match error with
       | .unsupported _ => pure #[]
       | _ => throw error

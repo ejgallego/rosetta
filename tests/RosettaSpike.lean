@@ -22,6 +22,26 @@ private def pureChecks : IO Unit := do
   check (byteOffset? source ⟨0, 8⟩ == none) "accepted CRLF as line content"
   check (byteOffset? source ⟨8, 0⟩ == none) "accepted nonexistent line"
   check (byteRange? source (range 1 2 0 0) == none) "accepted reversed range"
+  let mixed := "😀a\rβ\r\nc\n"
+  let index := SourceIndex.ofString mixed
+  check (index.lineCount == 4 && index.endPosition == ⟨3, 0⟩) "wrong mixed-ending line count"
+  let boundaries : Array (Lsp.Position × Nat) :=
+    #[(⟨0, 3⟩, 5), (⟨1, 0⟩, 6), (⟨1, 1⟩, 8), (⟨2, 0⟩, 10), (⟨3, 0⟩, 12)]
+  for (position, offset) in boundaries do
+    check (index.byteOffset? position == some offset && index.position? offset == some position)
+      s!"wrong mixed-ending byte conversion at {position}"
+  check (index.position? 2 == none && index.position? 9 == none && index.position? 13 == none)
+    "accepted a byte inside a UTF-8 character or CRLF, or past EOF"
+  check (index.clampedByteRange? (range 0 99 1 99) == some (range 0 3 1 1, 5, 8) &&
+    index.clampedByteRange? (range 0 99 0 100) == some (range 0 3 0 3, 5, 5) &&
+    index.clampedByteRange? (range 0 100 0 99) == none &&
+    index.clampedByteRange? (range 0 1 1 99) == none && index.clampedByteRange? (range 0 0 4 0) == none)
+    "server range clamping hid invalid positions or lost end-of-line semantics"
+  let mixedProjection ← IO.ofExcept <| compose #[.generated "pre\r\n",
+    .source { uri := "mixed", source := mixed, range := range 0 2 3 0 }]
+  let mixedMapped ← IO.ofExcept <| mixedProjection.mapRange (range 1 0 3 1)
+  check (mixedMapped.locations.size == 1 && mixedMapped.locations[0]!.range == range 0 2 2 1)
+    "projection mapping through mixed endings changed source coordinates"
   let projection ← IO.ofExcept <| compose #[
     .generated "//\n", .source { uri := "source", source, range := range 0 0 0 7 },
     .generated "\n", .source { uri := "source-two", source, range := range 1 2 1 6 },
@@ -86,6 +106,21 @@ private def bundleChecks : IO Unit := do
   check (toJson replay == toJson bundle) "bundle replay lost caller provenance"
   let mapped ← IO.ofExcept <| request.authoredLocations (range 0 1 0 3)
   check (mapped[0]?.any (·.range == range 10 3 10 5)) "authored diagnostic mapping is not derived correctly"
+
+  let mixed := { request with text := "😀a\rβ\r\nc\n", origins := #[
+    ⟨"file:///authored", 10, 2⟩, ⟨"file:///authored", 11, 0⟩,
+    ⟨"file:///authored", 12, 1⟩, ⟨"file:///authored", 13, 0⟩] }
+  let mapped ← IO.ofExcept <| mixed.authoredLocations (range 0 2 2 1)
+  check (mapped.map (·.range) == #[range 10 4 10 5, range 11 0 11 1, range 12 1 12 2])
+    "authored diagnostics used different line endings from source projection"
+  let some initial := bundle.requests[0]? | throw <| IO.userError "missing test snapshot"
+  let mixedSnapshot := { initial with request := mixed, tokens := .ok #[
+    { range := range 1 0 1 1, tokenType := "test", modifiers := #[] }] }
+  IO.ofExcept ({ bundle with requests := #[mixedSnapshot] }.validate)
+  let invalid := { mixedSnapshot with tokens := .ok #[
+    { range := range 1 0 1 2, tokenType := "test", modifiers := #[] }] }
+  check (!({ bundle with requests := #[invalid] }.validate).isOk)
+    "saved tokens accepted an oversized column"
 
 private def awaitNotification (client : Client) (method : String) : IO Unit := do
   let deadline := (← IO.monoMsNow) + 2000
@@ -627,6 +662,13 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
         "notification sent during initialization was lost"
       let location ← client.lookupSymbol "measure" container
       assertCheck (location == indexedLocation) "lookup did not return the indexed location"
+      assertCheck ((← client.lookupSymbols "measure" container) == #[indexedLocation])
+        "exact workspace matches included a duplicate or another container"
+      let secondLocation := { indexedLocation with range := range 0 10 0 26 }
+      assertCheck ((← client.lookupSymbols "measure") == #[indexedLocation, secondLocation])
+        "exact workspace matches omitted ambiguity or changed server order"
+      assertCheck ((← client.lookupSymbols "missing").isEmpty)
+        "exact workspace matches did not return an empty array for a missing symbol"
       assertCheck (← failsWith (client.lookupSymbol "missing")
         (fun error => error matches .invalidInput _)) "lookup accepted a missing symbol"
       assertCheck (← failsWith (client.lookupSymbol "measure")
@@ -657,6 +699,20 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       for name in #["bad-uri", "bad-range"] do
         assertCheck (← failsWith (client.lookupSymbol name container)
           (fun error => error matches .protocol _)) s!"lookup hid an invalid workspace symbol location: {name}"
+      for name in #["change-name", "change-kind", "change-container", "change-uri", "reverse-range",
+                    "reversed-location"] do
+        assertCheck (← failsWith (client.lookupSymbols name) (fun error => error matches .protocol _))
+          s!"exact lookup accepted an inconsistent workspace symbol: {name}"
+        assertCheck (← failsWith (client.workspaceSymbols name) (fun error => error matches .protocol _))
+          s!"raw lookup accepted an inconsistent workspace symbol: {name}"
+      let completed ← client.workspaceSymbols "complete-container"
+      assertCheck (completed.size == 1 && completed[0]?.any (·.containerName? == some "Other"))
+        "resolution could not supply a previously absent container"
+      assertCheck ((← client.lookupSymbols "complete-container" (some "Other")).isEmpty)
+        "exact lookup matched a container that was absent before resolution"
+      let remoteUri := sourceUri.replace "file:///" "file://authority/"
+      assertCheck (← failsWith (client.sourceExcerpt "test-language" { indexedLocation with uri := remoteUri })
+        (fun error => error matches .unsupported _)) "a remote authority could read a local path"
       let traffic ← client.request "test/workspace-traffic" .null
       assertCheck (traffic == Json.mkObj [("documentOpens", toJson 0), ("definitionRequests", toJson 0)])
         s!"workspace lookup sent document traffic: {traffic}"
@@ -725,7 +781,7 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       edited.close
       client.withDocument sourceUri "test-language" overlayText fun _ => pure ()
       assertCheck ((← client.document? sourceUri).isNone) "owned scoped document was not closed"
-      let doubleFailure ← (client.withDocument sourceUri "test-language" overlayText fun document => do
+      let doubleFailure ← (client.withDocument targetUri "test-language" overlayText fun document => do
         document.close
         throw (α := Unit) <| ClientError.invalidInput "action failed").toBaseIO
       assertCheck (match doubleFailure with
@@ -830,8 +886,8 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
             plain.pieces[0]!.tokenType.isEmpty && plain.pieces[0]!.modifiers.isEmpty)
             "unsupported tokens changed Unicode or CRLF in the exact excerpt"
           assertCheck (← failsWith (client.sourceExcerpt "test-language" {
-            indexedLocation with range := range 0 100 0 101 }) (fun error => error matches .protocol _))
-            "unsupported tokens hid an invalid source range"
+            indexedLocation with range := range 0 100 0 99 }) (fun error => error matches .protocol _))
+            "unsupported tokens hid a reversed source range"
           client.withDocument sourceUri "test-language" symbolText fun document => do
             assertCheck (← failsWith (document.semanticTokens (some wholeRange))
               (fun error => error matches .unsupported _)) "the direct token request lost its capability error"
@@ -839,6 +895,18 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
           client.withDocument sourceUri "test-language" symbolText fun document => do
             assertCheck (← failsWith document.semanticTokens (fun error => error matches .unsupported _))
               "range-only server received a full-document request"
+    Client.withSession (workspaceConfig sourceUri [("tokenMode", "range"),
+        ("expectedTokenRange", toJson (range 0 26 1 6))]) fun client => do
+      let mixedText := symbolText.replace "\r\n" "\r" ++ "😀tail\n"
+      let clientLocation := { indexedLocation with range := range 0 99 1 99 }
+      client.withDocument sourceUri "test-language" mixedText fun _ => do
+        let excerpt ← client.sourceExcerpt "test-language" clientLocation
+        assertCheck (excerpt.location == clientLocation &&
+          String.join (excerpt.pieces.toList.map HighlightedPiece.text) == "\r😀tail")
+          "clamping a server location lost the original range or changed the exact source slice"
+        for bad in #[range 0 4 0 26, range 0 0 3 0, range 0 100 0 99] do
+          assertCheck (← failsWith (client.sourceExcerpt "test-language" { clientLocation with range := bad })
+            (fun error => error matches .protocol _)) "invalid server range reached the token request"
     for failureMode in #["server-error", "disconnect", "protocol", "deadline"] do
       Client.withSession { workspaceConfig sourceUri [("tokenMode", toJson failureMode)] with
           timeoutMs := 1000 } fun client => do

@@ -99,3 +99,14 @@ needs Go to Definition, call `document.definitions position` at a known
 reference and select the target to display. Missing token support gives a
 plain excerpt. Explicit `document.semanticTokens` requests still report
 unsupported operations.
+
+Use `client.lookupSymbols name container?` when the caller wants to handle an
+empty result or select from multiple exact matches. It returns distinct indexed
+locations in server order. `lookupSymbol` and `symbolSource` require a single
+location.
+
+Source excerpts clamp oversized UTF-16 columns on existing lines, while saved
+analysis spans and source projections still require strict UTF-16 boundaries.
+An excerpt keeps the original supplied location. CR, LF and CRLF each count as
+one line ending. When building requests directly, supply one authored origin
+per LSP line, including the final empty line after a terminator.

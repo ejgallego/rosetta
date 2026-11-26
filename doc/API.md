@@ -66,14 +66,18 @@ The result is a `SourceExcerpt` containing the indexed `location`, the requested
 range. An index entry spanning `MyType measure();` yields that declaration.
 An entry spanning only `measure` yields only the name.
 
-Use `client.lookupSymbol "compress" (container? := some "EdwardsPoint")`
-for the `Lsp.Location` alone. Rosetta sends the name to `workspace/symbol`
+Use `client.lookupSymbols "compress" (container? := some "EdwardsPoint")`
+for an array of distinct `Lsp.Location` values in server order. The array can
+be empty or contain several locations. Rosetta sends the name to `workspace/symbol`
 and filters candidates by exact name and optional server-reported
 `containerName`. It requests `workspaceSymbol/resolve` only for matching
 candidates with a deferred range. Duplicate hits at the same URI and range
 count as one location. Omitting the container searches across all containers.
-Lookup works on the index alone, including for an unopened non-file URI.
-For all search candidates, use `client.workspaceSymbols query`.
+`client.lookupSymbol name container?` requires exactly one matching location.
+Both calls work on the index alone, including for an unopened non-file URI.
+For all search candidates, use `client.workspaceSymbols query`. Both search APIs
+reject reversed ranges and reject a resolve response that changes the candidate's
+name, kind, URI or previously supplied container.
 
 For Go to Definition, call `document.definitions position` with the position
 of the reference you want to follow. In `MyType measure();`, asking at the
@@ -85,21 +89,24 @@ Use `client.sourceExcerpt languageId location` to read any `Lsp.Location`.
 When the document is open, Rosetta borrows its current overlay and checks
 that the language matches. A workspace symbol range carries no document
 version, so an edit since indexing can change the text at that range. For an
-unopened file, Rosetta reads it from disk and opens a temporary document. A
-non-file URI needs an open overlay. A concurrent edit or close that invalidates
-a borrowed version is reported at scope release.
+unopened local file URI without a query or fragment, Rosetta reads it from disk
+and opens a temporary document. Other URIs need an open overlay. A concurrent
+edit or close that invalidates a borrowed version is reported at scope release.
 
-Concatenating `pieces` reproduces the selected source text, including Unicode
-and CRLF. Rosetta requests range tokens when available and otherwise uses full
-tokens when supported. It clips tokens at the excerpt boundaries. Missing token
+Concatenating `pieces` reproduces the selected text, including Unicode and CR,
+LF or CRLF line endings. Oversized UTF-16 columns on existing lines select the
+end of those lines. Reversed ranges, missing lines and columns that split a
+surrogate pair are protocol errors. `SourceExcerpt.location` retains the supplied
+range. Rosetta requests range tokens using the clamped coordinates or uses full
+tokens when range tokens are unavailable. It clips tokens at the excerpt boundaries. Missing token
 support or a null token result yields plain text. A caller explicitly requesting
 tokens with `document.semanticTokens range?` receives `ClientError.unsupported`
 when the requested operation is unavailable.
 
-Named lookup reports `ClientError.invalidInput` if the name or supplied
-container is empty, or if the server returns zero or several distinct matching
-locations. Malformed replies, server errors, timeouts, disconnections, and
-source-reading failures propagate to the caller.
+Exact lookup reports `ClientError.invalidInput` if the name or supplied
+container is empty. `lookupSymbol` and `symbolSource` also report it when the
+server returns zero or several distinct matching locations. Malformed replies,
+server errors, timeouts, disconnections and source-reading failures propagate.
 
 Initialization options remain caller-owned. For example, rust-analyzer needs
 `workspace.symbol.search.kind = "all_symbols"` to include methods. Workspace
@@ -135,8 +142,8 @@ server-specific predicate and experimental capabilities needed to enable it.
 
 `Client.notifications` independently retains the latest 512 general notifications
 with an eviction count. Diagnostics remain in `Document.diagnostics`, outside
-both general-notification stores. The generic API contains no Rust names, source
-paths, or Rust syntax assumptions; the author supplies the reference separator.
+both general-notification stores. The generic API accepts server-reported symbol
+names and containers without parsing language-specific syntax.
 
 ## Error contract
 
@@ -188,8 +195,8 @@ There are four distinct operations:
 - `lspCode` records authored source to analyze in a registered context.
 - `lspRef` queries an expression in that context's composed scope, using the
   profile's language-specific wrapper. It does not search a workspace index.
-- `lookupSymbol` finds a unique indexed location for an exact symbol name and
-  optional container.
+- `lookupSymbols` finds all distinct indexed locations for an exact symbol name
+  and optional container. `lookupSymbol` requires one location.
 - `sourceExcerpt` presents an existing source range, using an open overlay when
   available. `symbolSource` combines lookup and excerpt in one call.
 
@@ -200,9 +207,9 @@ version, cancellation, deadline, IO and cleanup failures abort with their typed
 
 `QuerySnapshot.definitions` preserves the ranges returned by the prover.
 For a definition in the composed document, `analyze` maps its selection range
-back to the request keys in `localTargets`. The projection recognizes LF and
-CRLF line endings. A UTF-16 column beyond the end of its line resolves to the
-end of that line for this lookup.
+back to the request keys in `localTargets`. Source projection and authored
+locations recognize CR, LF and CRLF line endings. A definition selection column
+beyond the end of its line resolves to the end of that line.
 
 Bundle revision 2 stores diagnostics only in request coordinates. Authored
 locations are derived by `Request.authoredLocations`, never duplicated in JSON.
