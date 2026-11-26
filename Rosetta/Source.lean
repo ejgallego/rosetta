@@ -21,7 +21,8 @@ private structure SourceLine where
 /-- A reusable index of UTF-8 offsets and UTF-16 LSP positions. CR, LF and CRLF
 are line endings, and index entries contain only the content of each line. -/
 structure SourceIndex where
-  private text : String
+  private mk ::
+  private contents : String
   private lines : Array SourceLine
 
 def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
@@ -40,7 +41,11 @@ def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
       length := length + c.utf16Size.toNat
     offset := offset + c.utf8Size
     afterCR := c == '\r'
-  return { text, lines := lines.push { start, stop := offset, length } }
+  return { contents := text, lines := lines.push { start, stop := offset, length } }
+
+instance : Inhabited SourceIndex := ⟨SourceIndex.ofString ""⟩
+
+def SourceIndex.text (index : SourceIndex) : String := index.contents
 
 def SourceIndex.lineCount (index : SourceIndex) : Nat := index.lines.size
 
@@ -55,6 +60,9 @@ def SourceIndex.lineByteRange? (index : SourceIndex) (line : Nat) : Option (Nat 
 def SourceIndex.endPosition (index : SourceIndex) : Lsp.Position :=
   let line := index.lineCount - 1
   ⟨line, (index.lineLength? line).getD 0⟩
+
+def SourceIndex.fullRange (index : SourceIndex) : Lsp.Range :=
+  { start := ⟨0, 0⟩, «end» := index.endPosition }
 
 /-- Reject positions beyond a line or inside a UTF-16 surrogate pair. -/
 def SourceIndex.byteOffset? (index : SourceIndex) (pos : Lsp.Position) : Option Nat := Id.run do
@@ -117,12 +125,12 @@ def byteRange? (text : String) (range : Lsp.Range) : Option (Nat × Nat) :=
 
 structure SourceRange where
   uri : String
-  source : String
+  source : SourceIndex
   range : Lsp.Range
 deriving Inhabited
 
 /-- Each mapped piece is an exact source slice. Deindentation can be represented
-by one piece per line; wrappers are ordinary unmapped pieces. -/
+by one piece per line sharing the same source index. Wrappers are unmapped. -/
 inductive Piece where
   | generated (text : String)
   | source (location : SourceRange)
@@ -130,12 +138,17 @@ inductive Piece where
 private structure Segment where
   start : Nat
   stop : Nat
-  origin? : Option (SourceRange × SourceIndex × Nat)
+  origin? : Option (SourceRange × Nat)
+deriving Inhabited
 
 structure Projection where
-  text : String
+  private mk ::
   private segments : Array Segment
   private index : SourceIndex
+
+def Projection.sourceIndex (projection : Projection) : SourceIndex := projection.index
+
+def Projection.text (projection : Projection) : String := projection.index.text
 
 /-- Convert a UTF-8 byte offset in the composed text to an LSP position. -/
 def Projection.position? (projection : Projection) (offset : Nat) : Option Lsp.Position :=
@@ -148,44 +161,54 @@ def compose (pieces : Array Piece) : Except String Projection := do
     let (content, origin?) ← match piece with
       | .generated generated => pure (generated, none)
       | .source loc => do
-        let index := SourceIndex.ofString loc.source
-        let some (start, stop) := index.byteRange? loc.range
+        let some (start, stop) := loc.source.byteRange? loc.range
           | throw s!"invalid source range in {loc.uri}"
-        pure ((String.Pos.Raw.extract loc.source ⟨start⟩ ⟨stop⟩), some (loc, index, start))
+        pure ((String.Pos.Raw.extract loc.source.text ⟨start⟩ ⟨stop⟩), some (loc, start))
     if content.isEmpty && origin?.isNone then continue
     segments := segments.push {
       start := text.utf8ByteSize
       stop := text.utf8ByteSize + content.utf8ByteSize
       origin? }
     text := text ++ content
-  return { text, segments, index := SourceIndex.ofString text }
+  return { segments, index := SourceIndex.ofString text }
 
 structure MappedRange where
   locations : Array SourceRange := #[]
   containsGenerated : Bool := false
 
+private def Projection.firstSegmentAfter (projection : Projection) (offset : Nat) : Nat := Id.run do
+  let mut lo := 0
+  let mut hi := projection.segments.size
+  while lo < hi do
+    let mid := (lo + hi) / 2
+    if projection.segments[mid]!.stop ≤ offset then lo := mid + 1 else hi := mid
+  return lo
+
+private def Segment.mapRange (segment : Segment) (left right : Nat) (result : MappedRange) :
+    Except String MappedRange := do
+  let some (origin, sourceStart) := segment.origin? |
+    return { result with containsGenerated := true }
+  let some start := origin.source.position? (sourceStart + (left - segment.start))
+    | throw "invalid projected source start"
+  let some stop := origin.source.position? (sourceStart + (right - segment.start))
+    | throw "invalid projected source end"
+  let range : Lsp.Range := { start, «end» := stop }
+  return { result with locations := result.locations.push { origin with range } }
+
 private def Projection.mapByteRange (projection : Projection) (start stop : Nat) :
     Except String MappedRange := do
-  let pointIndex? := if start == stop then
-      projection.segments.findIdx? (fun segment => segment.start ≤ start && start < segment.stop) <|>
-        (if start == projection.text.utf8ByteSize && !projection.segments.isEmpty then
-          some (projection.segments.size - 1) else none)
-    else none
+  if start == stop then
+    let segment? := if start == projection.text.utf8ByteSize then projection.segments.back?
+      else projection.segments[projection.firstSegmentAfter start]?
+    let some segment := segment? | return {}
+    return ← segment.mapRange start stop {}
   let mut result : MappedRange := {}
-  for (segment, index) in projection.segments.zipIdx do
-    let ownsPoint := pointIndex? == some index
+  for index in [projection.firstSegmentAfter start:projection.segments.size] do
+    let segment := projection.segments[index]!
+    if segment.start ≥ stop then break
     let left := max start segment.start
     let right := min stop segment.stop
-    if left < right || ownsPoint then
-      match segment.origin? with
-      | none => result := { result with containsGenerated := true }
-      | some (origin, sourceIndex, sourceStart) =>
-        let some start := sourceIndex.position? (sourceStart + left - segment.start)
-          | throw "invalid projected source start"
-        let some stop := sourceIndex.position? (sourceStart + right - segment.start)
-          | throw "invalid projected source end"
-        let range : Lsp.Range := { start, «end» := stop }
-        result := { result with locations := result.locations.push { origin with range } }
+    if left < right then result ← segment.mapRange left right result
   return result
 
 /-- Split a range at projection boundaries instead of fabricating one source
@@ -196,12 +219,12 @@ def Projection.mapRange (projection : Projection) (range : Lsp.Range) :
     | throw "invalid analysis range"
   projection.mapByteRange start stop
 
-/-- Project a definition selection range returned for the composed document.
-An oversized UTF-16 column on an existing line denotes the end of that line. -/
-def Projection.mapDefinitionRange (projection : Projection) (range : Lsp.Range) :
-    Except String MappedRange := do
-  let some (_, start, stop) := projection.index.clampedByteRange? range
-    | throw "invalid definition selection range"
-  projection.mapByteRange start stop
+/-- Normalize a server range and project it back to the source. Oversized
+UTF-16 columns on existing lines denote the end of those lines. -/
+def Projection.mapServerRange (projection : Projection) (range : Lsp.Range) :
+    Except String (Lsp.Range × MappedRange) := do
+  let some (range, start, stop) := projection.index.clampedByteRange? range
+    | throw "invalid server range"
+  return (range, ← projection.mapByteRange start stop)
 
 end Rosetta

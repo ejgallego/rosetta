@@ -66,8 +66,8 @@ structure SemanticSpan where
 deriving ToJson, FromJson
 
 /-- The same strict span contract applies to live decoding and saved bundles. -/
-def validateSemanticSpans (source : String) (spans : Array SemanticSpan) : Except String Unit := do
-  let index := SourceIndex.ofString source
+def SourceIndex.validateSemanticSpans (index : SourceIndex) (spans : Array SemanticSpan) :
+    Except String Unit := do
   let mut previousStop := 0
   for span in spans do
     unless span.range.start.line == span.range.end.line do throw "multiline semantic token"
@@ -76,10 +76,13 @@ def validateSemanticSpans (source : String) (spans : Array SemanticSpan) : Excep
     unless previousStop ≤ start do throw "overlapping or unordered semantic tokens"
     previousStop := stop
 
+def validateSemanticSpans (source : String) (spans : Array SemanticSpan) : Except String Unit :=
+  (SourceIndex.ofString source).validateSemanticSpans spans
+
 /-- Decode full, non-overlapping, single-line semantic tokens using the server's
 legend and the exact document. Unknown legend indexes and invalid ranges fail
 explicitly, without changing the underlying source text. -/
-def semanticSpans (source : String) (provider result : Json) :
+def SourceIndex.semanticSpans (index : SourceIndex) (provider result : Json) :
     Except String (Array SemanticSpan) := do
   if result == .null then return #[]
   let legend ← provider.getObjVal? "legend"
@@ -106,7 +109,10 @@ def semanticSpans (source : String) (provider result : Json) :
     spans := spans.push {
       range, tokenType
       modifiers := (modifiers.zipIdx.filter (fun (_, bit) => mask.testBit bit)).map (·.1) }
-  validateSemanticSpans source spans
+  index.validateSemanticSpans spans
   return spans
+
+def semanticSpans (source : String) (provider result : Json) : Except String (Array SemanticSpan) :=
+  if result == .null then pure #[] else (SourceIndex.ofString source).semanticSpans provider result
 
 end Rosetta

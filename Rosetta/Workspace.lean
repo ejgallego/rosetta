@@ -60,10 +60,14 @@ def Document.definitions (document : Document) (position : Lsp.Position) :
     ("textDocument", Json.mkObj [("uri", toJson document.uri)]), ("position", toJson position)]
   EIO.ofExcept <| (definitionTargets result).mapError ClientError.protocol
 
-/-- Decode the server's semantic token legend against the exact opened text. -/
-def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := none) :
+/-- Decode semantic tokens against the opened text. An optional shared index
+must describe the text of this document version. -/
+def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := none)
+    (sourceIndex? : Option SourceIndex := none) :
     EIO ClientError (Array SemanticSpan) := do
   let text ← document.text
+  if sourceIndex?.any (·.text != text) then
+    throw <| ClientError.invalidInput "semantic token source index does not match the document text"
   let caps ← document.client.capabilities
   let some provider := (caps.getObjVal? "semanticTokensProvider").toOption
     | throw <| ClientError.unsupported "semantic tokens"
@@ -76,7 +80,10 @@ def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := 
   let params := [("textDocument", Json.mkObj [("uri", toJson document.uri)])]
   let params := if useRange then params ++ [("range", toJson range?)] else params
   let result ← document.request method (Json.mkObj params)
-  EIO.ofExcept <| (semanticSpans text provider result).mapError ClientError.protocol
+  let spans := match sourceIndex? with
+    | some index => index.semanticSpans provider result
+    | none => semanticSpans text provider result
+  EIO.ofExcept <| spans.mapError ClientError.protocol
 
 /-- Await retained notification params satisfying a readiness predicate. Configure
 the method in retainedNotificationMethods before startup. The caller owns
@@ -154,7 +161,7 @@ def Client.sourceExcerpt (client : Client) (languageId : String) (location : Lsp
     let index := SourceIndex.ofString text
     let some (range, start, stop) := index.clampedByteRange? location.range
       | throw <| ClientError.protocol "invalid source range"
-    let spans ← try document.semanticTokens (some range) catch error =>
+    let spans ← try document.semanticTokens (some range) (some index) catch error =>
       match error with
       | .unsupported _ => pure #[]
       | _ => throw error

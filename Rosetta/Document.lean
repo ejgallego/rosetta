@@ -145,13 +145,14 @@ def Bundle.validate (bundle : Bundle) : Except String Unit := do
     unless request.origins.size == sourceIndex.lineCount do
       throw s!"invalid authored line map: {request.key}"
     if let .ok tokens := snapshot.tokens then
-      validateSemanticSpans request.text tokens
+      sourceIndex.validateSemanticSpans tokens
     for query in snapshot.queries do
       unless (sourceIndex.byteRange? query.range).isSome do throw "invalid saved query range"
       for target in query.localTargets do
         unless bundle.requests.any (fun snapshot => snapshot.request.key == target &&
             snapshot.request.context == request.context) do throw "unknown local definition target"
     for diagnostic in snapshot.diagnostics do
-      discard <| request.authoredLocations diagnostic.range
+      unless (sourceIndex.byteRange? diagnostic.range).isSome do
+        throw "invalid request-relative diagnostic range"
 
 end Rosetta

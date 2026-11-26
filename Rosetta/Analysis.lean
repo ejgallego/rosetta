@@ -36,10 +36,7 @@ structure ContextProfile where
 private structure Placement where
   request : Request
   bodyStart : Nat
-
-private def fullRange (text : String) : Lsp.Range := {
-  start := ⟨0, 0⟩
-  «end» := (SourceIndex.ofString text).endPosition }
+  sourceIndex : SourceIndex
 
 private def prepare (profile : ContextProfile) (requests : Array Request) :
     Except String (Projection × Array Placement) := do
@@ -47,13 +44,13 @@ private def prepare (profile : ContextProfile) (requests : Array Request) :
   let mut offset := 0
   let mut placements := #[]
   for request in requests do
+    let source := SourceIndex.ofString request.text
     let beforeText := if request.kind == .reference then profile.referencePrefix else ""
     let suffix := if request.kind == .reference then profile.referenceSuffix else ""
     pieces := pieces.push (.generated beforeText)
     offset := offset + beforeText.utf8ByteSize
-    placements := placements.push { request, bodyStart := offset }
-    pieces := pieces.push (.source {
-      uri := request.key, source := request.text, range := fullRange request.text })
+    placements := placements.push { request, bodyStart := offset, sourceIndex := source }
+    pieces := pieces.push (.source { uri := request.key, source, range := source.fullRange })
     pieces := pieces.push (.generated (suffix ++ "\n"))
     offset := offset + request.text.utf8ByteSize + suffix.utf8ByteSize + 1
   return (← compose pieces, placements)
@@ -86,7 +83,7 @@ private def query (document : Document) (caps : Json) (projection : Projection)
   if let .ok targets := definitions then
     for target in targets do
       if target.uri != uri then continue
-      if let .ok mapped := projection.mapDefinitionRange target.selectionRange then
+      if let .ok (_, mapped) := projection.mapServerRange target.selectionRange then
         for location in mapped.locations do
           unless localTargets.contains location.uri do localTargets := localTargets.push location.uri
   return { range, hover, definitions, localTargets }
@@ -99,14 +96,14 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
     let document ← client.openDocument uri profile.languageId projection.text
     let evidence ← profile.collectDiagnostics document
     let caps ← client.capabilities
-    let tokens ← attempt document.semanticTokens
+    let tokens ← attempt (document.semanticTokens (sourceIndex? := some projection.sourceIndex))
     let mut snapshots := #[]
     let mut generatedDiagnostics := #[]
     let mut mappedDiagnostics : Array (String × Lsp.Diagnostic) := #[]
     for diagnostic in evidence.diagnostics do
-      let mapped ← EIO.ofExcept <| (projection.mapRange diagnostic.range).mapError ClientError.protocol
+      let (range, mapped) ← EIO.ofExcept <| (projection.mapServerRange diagnostic.range).mapError ClientError.protocol
       if mapped.containsGenerated || mapped.locations.isEmpty then
-        generatedDiagnostics := generatedDiagnostics.push diagnostic
+        generatedDiagnostics := generatedDiagnostics.push { diagnostic with range }
       for location in mapped.locations do
         let some request := requests.find? (·.key == location.uri)
           | throw <| ClientError.invalidInput "projection contains an unknown request"
@@ -132,7 +129,7 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
           throw <| ClientError.invalidInput "reference query offset is outside its text"
         let some position := projection.position? (placement.bodyStart + offset)
           | throw <| ClientError.invalidInput "reference query offset is not an LSP character boundary"
-        queries := queries.push (← query document caps projection position (fullRange request.text))
+        queries := queries.push (← query document caps projection position placement.sourceIndex.fullRange)
       else
         -- Bound eager hover/navigation work. No token support means plain code,
         -- while explicit reference queries continue to work independently.
@@ -140,7 +137,7 @@ private def analyzeContext (profile : ContextProfile) (requests : Array Request)
           unless #["function", "method", "variable", "parameter", "type", "namespace"].contains token.tokenType do
             continue
           if queries.size ≥ 32 then break
-          let some (start, _) := byteRange? request.text token.range
+          let some (start, _) := placement.sourceIndex.byteRange? token.range
             | throw <| ClientError.invalidInput "invalid projected token"
           let some position := projection.position? (placement.bodyStart + start)
             | throw <| ClientError.invalidInput "invalid projected token start"

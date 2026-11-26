@@ -38,13 +38,14 @@ private def pureChecks : IO Unit := do
     index.clampedByteRange? (range 0 1 1 99) == none && index.clampedByteRange? (range 0 0 4 0) == none)
     "server range clamping hid invalid positions or lost end-of-line semantics"
   let mixedProjection ← IO.ofExcept <| compose #[.generated "pre\r\n",
-    .source { uri := "mixed", source := mixed, range := range 0 2 3 0 }]
+    .source { uri := "mixed", source := index, range := range 0 2 3 0 }]
   let mixedMapped ← IO.ofExcept <| mixedProjection.mapRange (range 1 0 3 1)
   check (mixedMapped.locations.size == 1 && mixedMapped.locations[0]!.range == range 0 2 2 1)
     "projection mapping through mixed endings changed source coordinates"
+  let sourceIndex := SourceIndex.ofString source
   let projection ← IO.ofExcept <| compose #[
-    .generated "//\n", .source { uri := "source", source, range := range 0 0 0 7 },
-    .generated "\n", .source { uri := "source-two", source, range := range 1 2 1 6 },
+    .generated "//\n", .source { uri := "source", source := sourceIndex, range := range 0 0 0 7 },
+    .generated "\n", .source { uri := "source-two", source := sourceIndex, range := range 1 2 1 6 },
     .generated "\n}" ]
   check (projection.text == "//\n😀alpha\nβeta\n}") "projection changed source text"
   let mapped ← IO.ofExcept <| projection.mapRange (range 1 2 1 7)
@@ -58,11 +59,32 @@ private def pureChecks : IO Unit := do
   check (point.locations.size == 1 && point.locations[0]!.range == range 1 2 1 2)
     "empty range chose the preceding piece"
   check (!(projection.mapRange (range 1 1 1 2)).isOk) "mapped an invalid surrogate position"
+  let (normalized, mapped) ← IO.ofExcept <| projection.mapServerRange (range 1 2 1 99)
+  check (normalized == range 1 2 1 7 && mapped.locations[0]?.any (·.range == range 0 2 0 7) &&
+    !(projection.mapRange (range 1 2 1 99)).isOk)
+    "strict and server range projection did not distinguish oversized columns"
+  let emptyIndex := SourceIndex.ofString ""
   let empty ← IO.ofExcept <| compose #[.source {
-    uri := "empty-source", source := "", range := range 0 0 0 0 }]
+    uri := "empty-source", source := emptyIndex, range := emptyIndex.fullRange }]
   let emptyMapped ← IO.ofExcept <| empty.mapRange (range 0 0 0 0)
   check (emptyMapped.locations.size == 1 && emptyMapped.locations[0]!.uri == "empty-source")
     "empty authored fragment lost its source identity"
+  let first := SourceIndex.ofString "😀"
+  let second := SourceIndex.ofString "β"
+  let seam ← IO.ofExcept <| compose #[
+    .source { uri := "same", source := first, range := first.fullRange },
+    .source { uri := "empty", source := emptyIndex, range := emptyIndex.fullRange },
+    .source { uri := "same", source := second, range := second.fullRange },
+    .source { uri := "end", source := emptyIndex, range := emptyIndex.fullRange }]
+  let fragments ← IO.ofExcept <| seam.mapRange (range 0 0 0 3)
+  check (fragments.locations.map (·.source.text) == #["😀", "β"])
+    "projected slices mixed distinct source snapshots of the same URI or included empty slices"
+  let boundary ← IO.ofExcept <| seam.mapRange (range 0 2 0 2)
+  check (boundary.locations.size == 1 && boundary.locations[0]!.source.text == "β")
+    "a point at a seam was assigned to an empty or preceding slice"
+  let eof ← IO.ofExcept <| seam.mapRange (range 0 3 0 3)
+  check (eof.locations.size == 1 && eof.locations[0]!.uri == "end")
+    "an EOF point lost its final empty source segment"
   let targetRange := range 1 0 3 0
   let selection := range 1 4 1 8
   let targets ← IO.ofExcept <| definitionTargets <| .arr #[
@@ -90,6 +112,7 @@ private def bundleChecks : IO Unit := do
       key := "demo", languageId := "test", diagnosticCoverage := "test"
       completion := .null, provenance := Json.mkObj [("revision", toJson "caller-owned")], generatedDiagnostics := #[] }] }
   IO.ofExcept bundle.validate
+  let some initial := bundle.requests[0]? | throw <| IO.userError "missing test snapshot"
   for spans in #[
       #[{ range := range 0 0 0 3, tokenType := "test", modifiers := #[] },
         { range := range 0 2 0 4, tokenType := "test", modifiers := #[] }],
@@ -97,11 +120,14 @@ private def bundleChecks : IO Unit := do
       #[{ range := range 0 1 1 0, tokenType := "test", modifiers := #[] }],
       #[{ range := range 0 2 0 4, tokenType := "test", modifiers := #[] },
         { range := range 0 0 0 2, tokenType := "test", modifiers := #[] }]] do
-    let some initial := bundle.requests[0]? | throw <| IO.userError "missing test snapshot"
     let saved := { initial with tokens := .ok spans }
     check (!({ bundle with requests := #[saved] }.validate).isOk)
       "saved bundle accepted invalid spans rejected by the live contract"
   check (!({ bundle with formatRevision := 1 }.validate).isOk) "accepted obsolete bundle schema"
+  let oversized := { initial with diagnostics := #[
+    { range := range 0 0 0 99, message := "oversized saved range" }] }
+  check (!({ bundle with requests := #[oversized] }.validate).isOk)
+    "bundle validation clamped a saved diagnostic range"
   let replay ← IO.ofExcept <| (fromJson? (toJson bundle) : Except String Bundle)
   check (toJson replay == toJson bundle) "bundle replay lost caller provenance"
   let mapped ← IO.ofExcept <| request.authoredLocations (range 0 1 0 3)
@@ -226,13 +252,20 @@ private def localDefinitionChecks (server : String) : EIO ClientError Unit := do
       initializationOptions := Json.mkObj [("mode", toJson "local-definition")] }
     document := "/tmp/rosetta-analysis.mock"
     referencePrefix := "", referenceSuffix := ""
-    collectDiagnostics := fun _ => pure { coverage := "mock", diagnostics := #[] } }
+    collectDiagnostics := fun _ => pure { coverage := "mock", diagnostics := #[
+      { range := range 0 0 0 99, message := "source" },
+      { range := range 0 99 1 0, message := "generated" }] } }
   let declaration : Request := {
     key := "decl", context := profile.key, kind := .code
     text := "x", origins := #[⟨"authored", 0, 0⟩] }
   let exact := { declaration with key := "exact", kind := .reference }
   let oversized := { exact with key := "oversized" }
   let bundle ← analyze #[profile] #[declaration, exact, oversized]
+  let snapshot ← IO.ofExcept <| bundle.find declaration
+  check (snapshot.diagnostics.map (·.range) == #[range 0 0 0 1] &&
+    bundle.contexts[0]?.any (fun context =>
+      context.generatedDiagnostics.map (·.range) == #[range 0 1 1 0]))
+    "analysis did not normalize live diagnostic columns before saving source and generated ranges"
   for (request, endCharacter) in #[(exact, 1), (oversized, 99)] do
     let snapshot ← IO.ofExcept <| bundle.find request
     let #[query] := snapshot.queries | check false s!"{request.key}: expected one reference query"
@@ -584,11 +617,9 @@ private def probe (language command root : String) : EIO ClientError Unit := do
     -- generated context; only the fragment has an authored-source location.
     let invalid := if language == "rust" then "fn invalid( {\n"
       else "Check missing_name.\n"
-    let invalidRange : Lsp.Range := {
-      start := ⟨0, 0⟩
-      «end» := (FileMap.ofString invalid).utf8PosToLspPos ⟨invalid.utf8ByteSize⟩ }
+    let invalidSource := SourceIndex.ofString invalid
     let projection ← IO.ofExcept <| compose #[.generated (text ++ "\n"),
-      .source { uri := "verso-source://spike/invalid", source := invalid, range := invalidRange }]
+      .source { uri := "verso-source://spike/invalid", source := invalidSource, range := invalidSource.fullRange }]
     document ← document.change projection.text
     let mut invalidCompletion := Json.null
     if language == "rocq" then invalidCompletion ← rocqDocument document
@@ -597,7 +628,7 @@ private def probe (language command root : String) : EIO ClientError Unit := do
     let invalidHasError := invalidDiagnostics.any (·.severity? == some .error)
     let mut mappedLocations := #[]
     for diagnostic in invalidDiagnostics do
-      let mapped ← IO.ofExcept <| projection.mapRange diagnostic.range
+      let (_, mapped) ← IO.ofExcept <| projection.mapServerRange diagnostic.range
       for location in mapped.locations do
         mappedLocations := mappedLocations.push <| Json.mkObj [
           ("uri", toJson location.uri), ("range", toJson location.range),
@@ -745,6 +776,9 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       -- Workspace helpers must prefer an admitted overlay and borrow it.
       let overlayText := "/* 😀 */ MyType collect();\r\n"
       let overlay ← client.openDocument sourceUri "test-language" overlayText
+      check (← failsWith (overlay.semanticTokens (sourceIndex? := some (SourceIndex.ofString symbolText)))
+        (fun error => error matches .invalidInput _))
+        "token decoding accepted the disk index for a different unsaved overlay"
       assertCheck ((← client.lookupSymbol "measure" container) == indexedLocation)
         "workspace lookup depended on the overlay contents"
       check (← failsWith (client.symbolSource "another-language" "measure" container)

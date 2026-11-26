@@ -105,8 +105,20 @@ empty result or select from multiple exact matches. It returns distinct indexed
 locations in server order. `lookupSymbol` and `symbolSource` require a single
 location.
 
-Source excerpts clamp oversized UTF-16 columns on existing lines, while saved
-analysis spans and source projections still require strict UTF-16 boundaries.
+Source excerpts and live diagnostics clamp oversized UTF-16 columns to the
+end of the line. Saved request spans must already have valid UTF-16 ranges.
 An excerpt keeps the original supplied location. CR, LF and CRLF each count as
 one line ending. When building requests directly, supply one authored origin
 per LSP line, including the final empty line after a terminator.
+
+## Composing source slices
+
+Create one `SourceIndex.ofString text` for each version of an input. Pass that
+value as `SourceRange.source` to every slice of the same text. For a whole
+input, use `index.fullRange`. This lets a projection retain one line index
+when a deindented block has a separate slice for each line.
+
+For a diagnostic or definition range received from a server, use
+`projection.mapServerRange range`. It returns the normalized range in the
+composed document and the corresponding source locations. Use
+`projection.mapRange range` for a range that already uses exact coordinates.

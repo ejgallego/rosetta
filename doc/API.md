@@ -208,14 +208,18 @@ version, cancellation, deadline, IO and cleanup failures abort with their typed
 `QuerySnapshot.definitions` preserves the ranges returned by the prover.
 For a definition in the composed document, `analyze` maps its selection range
 back to the request keys in `localTargets`. Source projection and authored
-locations recognize CR, LF and CRLF line endings. A definition selection column
-beyond the end of its line resolves to the end of that line.
+locations recognize CR, LF and CRLF line endings. A live diagnostic or
+definition selection that extends past the end of a line is clamped to that
+line. Diagnostics on generated text retain normalized coordinates in the
+composed document.
 
-Bundle revision 2 stores diagnostics only in request coordinates. Authored
-locations are derived by `Request.authoredLocations`, never duplicated in JSON.
+Bundle revision 2 stores each request's diagnostics in request coordinates.
+Use `Request.authoredLocations` to recover their locations in the authored file.
 Live semantic tokens and replay share `validateSemanticSpans`: ranges must be
 positive, single-line, ordered, non-overlapping and on valid UTF-16 boundaries.
-`SourceIndex` lets repeated conversions share a precomputed line index.
+Each `SourceRange` stores its immutable `SourceIndex`. To split a file into
+many pieces, construct that index once and pass it to each slice. A second
+version of the file gets its own index, even if the URI is the same.
 
 `ContextProfile.provenance : Json` is caller-owned evidence copied into the
 context observation. It can record project revision, server version and profile

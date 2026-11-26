@@ -130,14 +130,14 @@ instance : Verso.ArgParse.FromArgs ReferenceConfig m where
     .positional `key .string <*> .positional `written (.withSyntax .string) <*> .named' `context false
 end
 
-private initialize authoredSourceIndex : EnvExtension (Option (String × SourceIndex)) ←
+private initialize authoredSourceIndex : EnvExtension (Option SourceIndex) ←
   registerEnvExtension (pure none) (asyncMode := .local)
 
 private def getAuthoredSourceIndex (source : String) : DocElabM SourceIndex := do
-  if let some (cachedSource, index) := authoredSourceIndex.getState (← getEnv) then
-    if cachedSource == source then return index
+  if let some index := authoredSourceIndex.getState (← getEnv) then
+    if index.text == source then return index
   let index := SourceIndex.ofString source
-  modifyEnv fun env => authoredSourceIndex.setState env (some (source, index))
+  modifyEnv fun env => authoredSourceIndex.setState env (some index)
   return index
 
 private def codeOrigins (contents : StrLit) : DocElabM (Array LineOrigin) := do
