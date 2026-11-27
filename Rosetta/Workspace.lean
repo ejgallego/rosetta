@@ -25,28 +25,26 @@ private def decodeWorkspaceSymbol (value : Json) : Except String Lsp.SymbolInfor
     throw "workspace symbol location has a reversed range"
   return symbol
 
-private def checkWorkspaceSymbolResolution (original : Json) (uri : Lsp.DocumentUri)
-    (resolved : Lsp.SymbolInformation) : Except String Unit := do
-  let name ← original.getObjValAs? String "name"
-  let kind ← original.getObjValAs? Lsp.SymbolKind "kind"
-  let container? ← original.getObjValAs? (Option String) "containerName"
-  unless resolved.name == name && resolved.kind == kind && resolved.location.uri == uri &&
-      container?.all (fun container => resolved.containerName? == some container) do
-    throw "workspace symbol resolution changed the symbol identity or URI"
-
 private def Client.resolveWorkspaceSymbol (client : Client) (value : Json) :
     EIO ClientError Lsp.SymbolInformation := do
   let location ← EIO.ofExcept <| (value.getObjVal? "location").mapError ClientError.protocol
   if (location.getObjVal? "range").isOk then
     return ← EIO.ofExcept <| (decodeWorkspaceSymbol value).mapError ClientError.protocol
   -- LSP WorkspaceSymbol may defer its location range until resolve.
-  let uri ← EIO.ofExcept <| (location.getObjValAs? Lsp.DocumentUri "uri").mapError ClientError.protocol
-  let response ← client.request "workspaceSymbol/resolve" value
-  EIO.ofExcept <| (do
-    let resolved ← decodeWorkspaceSymbol response
-    checkWorkspaceSymbolResolution value uri resolved
-    return resolved
+  let (name, kind, container?, uri) ← EIO.ofExcept <| (do
+    let name ← value.getObjValAs? String "name"
+    let kind ← value.getObjValAs? Lsp.SymbolKind "kind"
+    let container? ← value.getObjValAs? (Option String) "containerName"
+    discard <| value.getObjValAs? (Option (Array Lsp.SymbolTag)) "tags"
+    let uri ← location.getObjValAs? Lsp.DocumentUri "uri"
+    return (name, kind, container?, uri)
     ).mapError ClientError.protocol
+  let response ← client.request "workspaceSymbol/resolve" value
+  let resolved ← EIO.ofExcept <| (decodeWorkspaceSymbol response).mapError ClientError.protocol
+  unless resolved.name == name && resolved.kind == kind && resolved.location.uri == uri &&
+      container?.all (fun container => resolved.containerName? == some container) do
+    throw <| ClientError.protocol "workspace symbol resolution changed the symbol identity or URI"
+  return resolved
 
 /-- Search the workspace and resolve deferred locations in all returned candidates. -/
 def Client.workspaceSymbols (client : Client) (query : String) :

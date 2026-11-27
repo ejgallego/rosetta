@@ -730,6 +730,11 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       for name in #["bad-uri", "bad-range"] do
         assertCheck (← failsWith (client.lookupSymbol name container)
           (fun error => error matches .protocol _)) s!"lookup hid an invalid workspace symbol location: {name}"
+      for name in #["bad-deferred-kind", "bad-deferred-container", "bad-deferred-tags"] do
+        assertCheck (← failsWith (client.lookupSymbols name) (fun error => error matches .protocol _))
+          s!"exact lookup failed to reject a malformed deferred symbol before resolving it: {name}"
+        assertCheck (← failsWith (client.workspaceSymbols name) (fun error => error matches .protocol _))
+          s!"raw lookup failed to reject a malformed deferred symbol before resolving it: {name}"
       for name in #["change-name", "change-kind", "change-container", "change-uri", "reverse-range",
                     "reversed-location"] do
         assertCheck (← failsWith (client.lookupSymbols name) (fun error => error matches .protocol _))

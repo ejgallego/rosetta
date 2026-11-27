@@ -188,6 +188,15 @@ while True:
             reply(request_id, [workspace_symbol(1, "Container"), workspace_symbol(query, "Container")])
         elif query == "bad-container":
             reply(request_id, [workspace_symbol(query, 1), workspace_symbol(query, "Container")])
+        elif query in ("bad-deferred-kind", "bad-deferred-container", "bad-deferred-tags"):
+            symbol = workspace_symbol(query, "Container", resolve="server-error")
+            if query == "bad-deferred-kind":
+                del symbol["kind"]
+            elif query == "bad-deferred-container":
+                symbol["containerName"] = 1
+            else:
+                symbol["tags"] = ["invalid"]
+            reply(request_id, [symbol])
         elif query in ("bad-uri", "bad-range"):
             symbol = workspace_symbol(query, "Container", resolve="server-error")
             field = "uri" if query == "bad-uri" else "range"

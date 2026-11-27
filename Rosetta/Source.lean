@@ -25,8 +25,9 @@ structure SourceIndex where
   private contents : String
   private lines : Array SourceLine
 
-def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
-  let mut lines := #[]
+@[inline] private def scanSourceLines (text : String) (init : α)
+    (addLine : α → SourceLine → α) : α × SourceLine := Id.run do
+  let mut acc := init
   let mut start := 0
   let mut offset := 0
   let mut length := 0
@@ -34,14 +35,23 @@ def SourceIndex.ofString (text : String) : SourceIndex := Id.run do
   for c in text do
     if c == '\r' || c == '\n' then
       unless c == '\n' && afterCR do
-        lines := lines.push { start, stop := offset, length }
+        acc := addLine acc { start, stop := offset, length }
       start := offset + 1
       length := 0
     else
       length := length + c.utf16Size.toNat
     offset := offset + c.utf8Size
     afterCR := c == '\r'
-  return { contents := text, lines := lines.push { start, stop := offset, length } }
+  return (acc, { start, stop := offset, length })
+
+def SourceIndex.ofString (text : String) : SourceIndex :=
+  let (lines, last) := scanSourceLines text #[] Array.push
+  { contents := text, lines := lines.push last }
+
+/-- Compute the EOF position without retaining individual line bounds. -/
+def Internal.sourceEndPosition (text : String) : Lsp.Position :=
+  let (line, last) := scanSourceLines text 0 fun line _ => line + 1
+  ⟨line, last.length⟩
 
 instance : Inhabited SourceIndex := ⟨SourceIndex.ofString ""⟩
 
