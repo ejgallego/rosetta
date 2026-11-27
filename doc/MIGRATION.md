@@ -65,6 +65,55 @@ to a feature-failure string. Catch typed `ClientError` at the application bounda
 The earlier prototype's `.call`, `.withClient` and string-parsed IO errors remain
 obsolete; use `.request`, `.client`, and constructor matching.
 
+## Analysis controls and session reuse
+
+Existing `analyze profiles requests` calls keep the default of 32 eager query
+positions per code block. Pass an `AnalysisOptions` value as a third argument to
+set the budget, per-request timeout, or cancellation token. The returned bundle
+still uses revision 2.
+
+Add a second argument to each profile's `collectDiagnostics` callback.
+It receives the run's optional cancellation token. Pass it through to
+diagnostic RPCs and readiness waits, or use `fun document _ => …` for a
+callback that completes immediately.
+
+Use `analyzeWithClient client profile requests` to reuse a running server.
+Pass requests from that profile's context. If the project document is already
+open, its language and text must match the composed analysis document. Use
+the borrowed handle's `document.uri` for requests. It carries the caller's
+original LSP URI even when a profile reaches the file through another path.
+An explicit second `openDocument` through a local path alias now returns
+`invalidInput`. Use `document?` to retrieve the handle for the open overlay.
+Retain the `OwnedDocument` returned by `client.openDocument` for edits and
+explicit close. Both `withDocument` callbacks and `client.document?` now
+give you a query-only `Document`. Use `document.sourceExcerpt range` to read
+from a callback's existing scope. In a diagnostic profile the same helper
+reads from the exact overlay being analyzed. Forward the profile's token with
+`document.sourceExcerpt range (cancel? := cancel?)`. Both
+`Document.sourceExcerpt` and `Client.sourceExcerpt` accept an optional
+`timeoutMs` and `cancel?` to control the semantic token request.
+
+Code matching `documentCleanup` should now match `uri version cause original?`.
+If a scope times out while trying to enqueue its close, pass the URI and
+version from the error to `client.retryDocumentClose uri version` after the
+queue drains. Opening a path through a dangling symlink now fails before
+`didOpen`. Use the target path for a file that only exists in memory.
+
+Both `analyze` and `analyzeWithClient` now release their scoped document
+when analysis fails. For example, a server disconnect during analysis can
+also make `didClose` fail. If you previously matched on
+`ClientError.disconnected`, also check the original error carried by
+`ClientError.documentCleanup`.
+
+Relative `ContextProfile.document` paths now resolve under the client's project
+root. Use an absolute path if your profile previously depended on a document
+elsewhere. A profile's `referenceQueryOffset` must point to the start of a
+UTF-8 character inside the reference text and have an LSP position in the
+composed document. The byte between CR and LF has no LSP position.
+
+`Document.semanticTokens` and `Document.definitions` accept optional timeout
+and cancellation arguments after their range and position, respectively.
+
 ## Scoped documents and Linux session close
 
 Supply the admitted `languageId` when constructing `OpenDocument`. Edits keep

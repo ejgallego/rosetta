@@ -57,7 +57,10 @@ Use an exact commit compatible with your Lean version, then run `lake update
 rosetta`. For local development, replace the Git dependency with
 `require rosetta from "/path/to/rosetta"`.
 
-Then use `import Rosetta`. The main generator operation is
+Use `import Rosetta`. A generator that already owns an initialized language
+server can call `Rosetta.analyzeWithClient client profile requests` for repeated
+analyses in that session. To let Rosetta start and close a server for each used
+context, call `Rosetta.analyze`. With default analysis options its type is
 `Rosetta.analyze : Array ContextProfile → Array Request → EIO ClientError Bundle`.
 For a named symbol, `client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")`
 returns the location from the workspace index and the text it selects.

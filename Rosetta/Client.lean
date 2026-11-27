@@ -9,6 +9,7 @@ public import Rosetta.Framing
 public import Rosetta.Protocol
 public import Std.Sync.Mutex
 public import Std.Sync.CancellationToken
+import Rosetta.FileUri
 
 public section
 
@@ -33,6 +34,7 @@ structure ClientConfig where
   maxQueuedBytes : Nat := 8 * 1024 * 1024
   maxPendingRequests : Nat := 128
   maxInboundBytes : Nat := 16 * 1024 * 1024
+  deriving BEq
 
 def stdio : IO.Process.StdioConfig := {
   stdin := .piped, stdout := .piped, stderr := .piped }
@@ -42,11 +44,25 @@ private structure Outbound where
   requestId? : Option Nat := none
   deadline : Nat
 
+private inductive OverlayOwner where
+  | caller
+  | scoped
+  | awaitingClose
+  deriving BEq
+
+private structure Overlay extends OpenDocument where
+  filePath? : Option System.FilePath
+  owner : OverlayOwner
+
+private def Overlay.requireCallerOwner (overlay : Overlay) : EIO ClientError Unit := do
+  unless overlay.owner == .caller do
+    throw <| ClientError.invalidInput "document belongs to a temporary scope"
+
 private structure State where
   nextId : Nat := 0
   nextVersion : Int := 1
   pending : Std.HashMap Nat (Option (Except ClientError Json)) := {}
-  documents : Std.HashMap String OpenDocument := {}
+  documents : Std.HashMap String Overlay := {}
   queue : Array Outbound := #[]
   queuedBytes : Nat := 0
   active? : Option Outbound := none
@@ -73,13 +89,19 @@ structure Client where
   config : ClientConfig
   private cleanup : IO.Promise CloseReport
 
-/-- A document version in its owning session. Obtain a new handle after an edit;
-closing/reopening a URI never revives an older handle. -/
+/-- A query handle for a document version in its owning session. Obtain a new
+handle after an edit; closing and reopening a URI never revives an older handle. -/
 structure Document where
   private mk ::
   client : Client
   uri : String
   version : Int
+
+/-- A caller-owned overlay. Editing returns the handle for the new version. -/
+structure OwnedDocument extends Document where
+  private mk ::
+
+instance : Coe OwnedDocument Document := ⟨OwnedDocument.toDocument⟩
 
 private def fail (s : State) (error : ClientError) : State :=
   { s with failure? := s.failure? <|> some error, queue := #[], queuedBytes := 0, stopWriter := true }
@@ -95,14 +117,27 @@ private def enqueue (config : ClientConfig) (s : State) (frame : Outbound) : EIO
     throw ClientError.queueFull
   return { s with queue := s.queue.push frame, queuedBytes := s.queuedBytes + frame.payload.utf8ByteSize }
 
-private def checkedDocument (s : State) (uri : String) (version : Int) : EIO ClientError OpenDocument := do
+private def checkedDocument (s : State) (uri : String) (version : Int) : EIO ClientError Overlay := do
   let some doc := s.documents[uri]? | throw <| ClientError.staleDocument uri version none
   unless doc.version == version do throw <| ClientError.staleDocument uri version (some doc.version)
   return doc
 
+private def checkedQueryDocument (s : State) (uri : String) (version : Int) : EIO ClientError Overlay := do
+  let doc ← checkedDocument s uri version
+  if doc.owner == .awaitingClose then throw <| ClientError.invalidInput "document is awaiting close"
+  return doc
+
+private def State.findOverlay? (s : State) (uri : String) (filePath? : Option System.FilePath) :
+    Option (String × Overlay) := Id.run do
+  if let some doc := s.documents[uri]? then return some (uri, doc)
+  if let some filePath := filePath? then
+    for (openUri, doc) in s.documents do
+      if doc.filePath? == some filePath then return some (openUri, doc)
+  return none
+
 private def checkDocument (s : State) (document? : Option (String × Int)) : EIO ClientError Unit := do
   if let some (uri, expected) := document? then
-    discard <| checkedDocument s uri expected
+    discard <| checkedQueryDocument s uri expected
 
 private def protocol (value : Except String α) : EIO ClientError α :=
   EIO.ofExcept (value.mapError ClientError.protocol)
@@ -119,6 +154,13 @@ private def serializeCall (message : Option Json.Structured → JsonRpc.Message)
 
 private def notification (method : String) (params? : Option Json) : String :=
   serializeCall (JsonRpc.Message.notification method) params?
+
+private def didCloseParams (uri : String) : Json :=
+  toJson ({ textDocument := { uri } } : Lsp.DidCloseTextDocumentParams)
+
+private def checkLifecycleMethod (method : String) : EIO ClientError Unit := do
+  if #["textDocument/didOpen", "textDocument/didChange", "textDocument/didClose"].contains method then
+    throw <| ClientError.invalidInput "use document lifecycle operations"
 
 private partial def writeLoop (input : IO.FS.Stream) (state : Std.Mutex State) : EIO ClientError Unit := do
   try
@@ -238,10 +280,15 @@ private def dispatch (config : ClientConfig) (state : Std.Mutex State) (message 
         unless s.stopWriter do set (← enqueue config s { payload, deadline })
     else if method == "textDocument/publishDiagnostics" then
       let params ← protocol <| fromJson? (α := Lsp.PublishDiagnosticsParams) params
+      -- Resolve only against paths captured at didOpen. Unversioned evidence
+      -- must use the wire URI, as it cannot identify an admitted version.
+      let canonicalPath? := params.version?.bind fun _ => localFileUriPath? params.uri
       state.atomically do
-        modify fun s => match s.documents[params.uri]? with
+        modify fun s => match s.findOverlay? params.uri canonicalPath? with
           | none => s
-          | some doc => { s with documents := s.documents.insert params.uri (doc.publish params) }
+          | some (uri, doc) =>
+            let doc := { doc with toOpenDocument := doc.toOpenDocument.publish params }
+            { s with documents := s.documents.insert uri doc }
     else state.atomically do
       if config.retainedNotificationMethods.contains method then
         modify fun s => { s with latestNotifications := s.latestNotifications.insert method params }
@@ -300,8 +347,7 @@ private def Client.notifyCore (client : Client) (method : String) (params? : Opt
 /-- Admission to the bounded writer queue, not an acknowledgement by the peer.
 Document lifecycle notifications must use the document operations below. -/
 def Client.notify (client : Client) (method : String) (params : Json) : EIO ClientError Unit := do
-  if #["textDocument/didOpen", "textDocument/didChange", "textDocument/didClose"].contains method then
-    throw <| ClientError.invalidInput "use document lifecycle operations"
+  checkLifecycleMethod method
   client.notifyCore method (some params)
 
 private def Client.cancel (client : Client) (id : Nat) : EIO ClientError Unit := do
@@ -366,6 +412,7 @@ private def Client.requestCore (client : Client) (method : String) (params? : Op
 Return its result, or a structured server error retaining the code and data. -/
 def Client.request (client : Client) (method : String) (params : Json)
     (timeoutMs : Nat := client.config.timeoutMs) (cancel? : Option Std.CancellationToken := none) : EIO ClientError Json := do
+  checkLifecycleMethod method
   if (params.getObjVal? "textDocument").isOk then
     throw <| ClientError.invalidInput "document requests require a document handle"
   client.requestCore method (some params) timeoutMs cancel?
@@ -374,6 +421,7 @@ def Client.request (client : Client) (method : String) (params : Json)
 The handle itself selects the owning client; it cannot be reused in another one. -/
 def Document.request (document : Document) (method : String) (params : Json)
     (timeoutMs : Nat := document.client.config.timeoutMs) (cancel? : Option Std.CancellationToken := none) : EIO ClientError Json := do
+  checkLifecycleMethod method
   unless (params.getObjVal? "textDocument" >>= (·.getObjValAs? String "uri")).toOption == some document.uri do
     throw <| ClientError.invalidInput "request URI does not match document handle"
   if let .ok raw := params.getObjVal? "textDocument" >>= (·.getObjVal? "version") then
@@ -381,30 +429,76 @@ def Document.request (document : Document) (method : String) (params : Json)
     unless version == document.version do throw <| ClientError.invalidInput "request version does not match document handle"
   document.client.requestCore method (some params) timeoutMs cancel? (some (document.uri, document.version))
 
-def Client.openDocument (client : Client) (uri languageId text : String) : EIO ClientError Document := do
+/-- Resolve existing path components before handling a virtual file's missing suffix. -/
+private partial def resolveFilePath (path : System.FilePath) : EIO ClientError System.FilePath := do
+  match ← (IO.FS.realPath path).toBaseIO with
+  | .ok resolved => return resolved
+  | .error realPathError =>
+    -- realPath can report other filesystem failures as a missing file.
+    let error ← match ← path.symlinkMetadata.toBaseIO with
+      | .ok { type := .symlink, .. } =>
+        throw <| ClientError.invalidInput s!"cannot resolve symbolic link in local document path: {path}"
+      | .ok _ => throw <| ClientError.io realPathError
+      | .error error => pure error
+    let .noFileOrDirectory .. := error | throw <| ClientError.io error
+    let some parent := path.parent | throw <| ClientError.io error
+    let resolved ← resolveFilePath parent
+    let component := path.components.getLastD ""
+    return if component.isEmpty || component == "." then resolved
+      else if component == ".." then resolved.parent.getD resolved
+      else if resolved.toString.endsWith System.FilePath.pathSeparator then
+        ⟨resolved.toString ++ component⟩
+      else resolved / component
+
+private def fileIdentity? (uri : String) : EIO ClientError (Option System.FilePath) := do
+  let some path := localFileUriPath? uri | return none
+  return some (← resolveFilePath path)
+
+private inductive DocumentAdmission where
+  | opened (document : Document)
+  | borrowed (document : Document)
+
+private def DocumentAdmission.document : DocumentAdmission → Document
+  | .opened document | .borrowed document => document
+
+-- Look up aliases and admit new opens in the same state transaction.
+private def Client.admitDocument (client : Client) (uri languageId text : String) (temporary : Bool) :
+    EIO ClientError DocumentAdmission := do
+  -- An exact wire URI can still identify an admitted overlay after a link breaks.
+  let fileIdentity ← (fileIdentity? uri).toBaseIO
   let deadline := (← IO.monoMsNow) + client.config.timeoutMs
-  let version ← client.state.atomically do
+  client.state.atomically do
     let s ← get
     admit s
-    if s.documents.contains uri then throw <| ClientError.invalidInput "document is already open"
+    if let some (uri, doc) := s.findOverlay? uri fileIdentity.toOption.join then
+      unless temporary do throw <| ClientError.invalidInput "document is already open"
+      doc.requireCallerOwner
+      return .borrowed { client, uri, version := doc.version }
+    let filePath? ← EIO.ofExcept fileIdentity
     let version := s.nextVersion
     let payload := notification "textDocument/didOpen" <| some <| Json.mkObj [
       ("textDocument", Json.mkObj [("uri", toJson uri), ("languageId", toJson languageId),
         ("version", toJson version), ("text", toJson text)])]
     let s ← enqueue client.config s { payload, deadline }
-    set { s with nextVersion := version + 1, documents := s.documents.insert uri { languageId, version, text } }
-    return version
-  return { client, uri, version }
+    let owner := if temporary then OverlayOwner.scoped else OverlayOwner.caller
+    set { s with
+      nextVersion := version + 1
+      documents := s.documents.insert uri { languageId, version, text, filePath?, owner } }
+    return .opened { client, uri, version }
 
-private def Document.snapshot (document : Document) : EIO ClientError OpenDocument :=
+/-- Open a document using the supplied wire URI. Reject an already open local alias. -/
+def Client.openDocument (client : Client) (uri languageId text : String) : EIO ClientError OwnedDocument := do
+  return ⟨(← client.admitDocument uri languageId text (temporary := false)).document⟩
+
+private def Document.snapshot (document : Document) : EIO ClientError Overlay :=
   document.client.state.atomically do
     let s ← get
     admit s
-    checkedDocument s document.uri document.version
+    checkedQueryDocument s document.uri document.version
 
 /-- Full replacement for full sync, a whole-document range for incremental sync.
 The returned handle supersedes the old version atomically with queue admission. -/
-def Document.change (document : Document) (text : String) : EIO ClientError Document := do
+def OwnedDocument.change (document : OwnedDocument) (text : String) : EIO ClientError OwnedDocument := do
   let client := document.client
   let caps ← client.capabilities
   let sync := (caps.getObjVal? "textDocumentSync").toOption.getD .null
@@ -418,6 +512,7 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
     let s ← get
     admit s
     let doc ← checkedDocument s document.uri document.version
+    doc.requireCallerOwner
     let version := s.nextVersion
     let payload := notification "textDocument/didChange" <| some <| Json.mkObj [
       ("textDocument", Json.mkObj [("uri", toJson document.uri), ("version", toJson version)]),
@@ -430,28 +525,66 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
     return version
   return { document with version }
 
-def Document.close (document : Document) : EIO ClientError Unit := do
+private def Document.closeCore (document : Document) (owner : OverlayOwner) : EIO ClientError Unit := do
   let client := document.client
-  let deadline := (← IO.monoMsNow) + client.config.timeoutMs
-  let payload := notification "textDocument/didClose" <| some <| Json.mkObj [
-    ("textDocument", Json.mkObj [("uri", toJson document.uri)])]
-  client.state.atomically do
-    let s ← get
-    admit s
-    checkDocument s (some (document.uri, document.version))
-    let s ← enqueue client.config s { payload, deadline }
-    set { s with documents := s.documents.erase document.uri }
+  let payload := notification "textDocument/didClose" (some (didCloseParams document.uri))
+  let releaseScope := owner == .scoped
+  let retryDeadline := (← IO.monoMsNow) + client.config.timeoutMs
+  let mut retry := false
+  repeat
+    let closed ← client.state.atomically do
+      let s ← get
+      admit s
+      let doc ← checkedDocument s document.uri document.version
+      unless doc.owner == owner do
+        throw <| ClientError.invalidInput (if owner == .awaitingClose then "document is not awaiting close"
+          else "document ownership does not match the close operation")
+      let now ← IO.monoMsNow
+      if retry && now ≥ retryDeadline then
+        set { s with documents := s.documents.insert document.uri { doc with owner := .awaitingClose } }
+        throw ClientError.queueFull
+      try
+        let s ← enqueue client.config s { payload, deadline := now + client.config.timeoutMs }
+        set { s with documents := s.documents.erase document.uri }
+        return true
+      catch
+      | .queueFull => if releaseScope then return false else throw ClientError.queueFull
+      | error => throw error
+    if closed then return
+    retry := true
+    let now ← IO.monoMsNow
+    if now < retryDeadline then IO.sleep (min 2 (retryDeadline - now)).toUInt32
+
+/-- Close a caller-owned overlay, checking that its version is still current. -/
+def OwnedDocument.close (document : OwnedDocument) : EIO ClientError Unit :=
+  document.toDocument.closeCore .caller
 
 /-- The exact text belonging to this admitted document version. -/
 def Document.text (document : Document) : EIO ClientError String := do
   return (← document.snapshot).text
 
-/-- Borrow the currently admitted version, without changing ownership. -/
-def Client.document? (client : Client) (uri : String) : EIO ClientError (Option Document) :=
-  client.state.atomically do
-    let s ← get
-    admit s
-    return s.documents[uri]?.map fun doc => { client, uri, version := doc.version }
+/-- The language of this admitted document version. -/
+def Document.languageId (document : Document) : EIO ClientError String := do
+  return (← document.snapshot).languageId
+
+/-- Find the currently admitted version for a URI or local file alias.
+The query handle uses the URI supplied when the document was opened. A path
+that cannot be resolved does not match an alias. -/
+def Client.document? (client : Client) (uri : String) : EIO ClientError (Option Document) := do
+  let lookup (filePath? : Option System.FilePath) : EIO ClientError (Option Document) :=
+    client.state.atomically do
+      let s ← get
+      admit s
+      return (s.findOverlay? uri filePath?).map fun (uri, doc) => { client, uri, version := doc.version }
+  if let some document ← lookup none then return some document
+  let .ok (some filePath) ← (fileIdentity? uri).toBaseIO | return none
+  lookup (some filePath)
+
+/-- Retry closing a temporary overlay whose release could not admit its close.
+Pass the original wire URI and version from `ClientError.documentCleanup`. -/
+def Client.retryDocumentClose (client : Client) (uri : String) (version : Int) : EIO ClientError Unit := do
+  let document : Document := { client, uri, version }
+  document.closeCore .awaitingClose
 
 private def Document.withRelease (document : Document) (release : EIO ClientError Unit)
     (action : Document → EIO ClientError α) : EIO ClientError α := do
@@ -460,28 +593,31 @@ private def Document.withRelease (document : Document) (release : EIO ClientErro
   match result, released with
   | .ok value, .ok () => return value
   | .error error, .ok () => throw error
-  | .ok _, .error cause => throw <| ClientError.documentCleanup document.uri cause none
-  | .error error, .error cause => throw <| ClientError.documentCleanup document.uri cause (some error)
+  | .ok _, .error cause => throw <| ClientError.documentCleanup document.uri document.version cause none
+  | .error error, .error cause =>
+    throw <| ClientError.documentCleanup document.uri document.version cause (some error)
 
-/-- Scope a borrowed handle with the expected language and optional text.
+/-- Scope a caller-owned handle with the expected language and optional text.
 Release validates the same admitted version and leaves the overlay in place. -/
 def Document.withBorrowed (document : Document) (languageId : String)
     (action : Document → EIO ClientError α) (text? : Option String := none) : EIO ClientError α := do
   let doc ← document.snapshot
+  doc.requireCallerOwner
   unless doc.languageId == languageId do
     throw <| ClientError.invalidInput "cannot change a borrowed document language"
   if text?.any (· != doc.text) then
     throw <| ClientError.invalidInput "cannot replace a borrowed document overlay"
   document.withRelease (discard document.snapshot) action
 
-/-- Scope an owned document, or borrow an open overlay with identical language
-and text. Both action and release failures are retained. -/
+/-- Open a temporary document or borrow a caller-owned overlay for the URI or
+a local file alias with identical language and text. The scope releases its
+temporary overlay, retrying a full queue for up to `ClientConfig.timeoutMs`.
+Both action and release failures are retained. -/
 def Client.withDocument (client : Client) (uri languageId text : String)
     (action : Document → EIO ClientError α) : EIO ClientError α := do
-  if let some document ← client.document? uri then
-    return ← document.withBorrowed languageId action (some text)
-  let document ← client.openDocument uri languageId text
-  document.withRelease document.close action
+  match ← client.admitDocument uri languageId text (temporary := true) with
+  | .opened document => document.withRelease (document.closeCore .scoped) action
+  | .borrowed document => document.withBorrowed languageId action (some text)
 
 def Document.diagnostics (document : Document) : EIO ClientError (Option DiagnosticSnapshot) := do
   return (← document.snapshot).diagnostics?
@@ -586,8 +722,7 @@ private def Client.closeCore (client : Client) : IO CloseReport := do
     set { s with pending := {}, documents := {} }
     return s.documents.toList.map (·.1)
   for uri in uris do
-    discard <| (client.notifyCore "textDocument/didClose" (some (Json.mkObj [
-      ("textDocument", Json.mkObj [("uri", toJson uri)])])) true).toBaseIO
+    discard <| (client.notifyCore "textDocument/didClose" (some (didCloseParams uri)) true).toBaseIO
   discard <| (client.requestCore "shutdown" none 500 none none true).toBaseIO
   discard <| (client.notifyCore "exit" none true).toBaseIO
   client.state.atomically do modify fun s => { s with stopWriter := true }

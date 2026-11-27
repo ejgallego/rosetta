@@ -52,17 +52,23 @@ def Client.workspaceSymbols (client : Client) (query : String) :
   (← client.requestWorkspaceSymbols query).mapM client.resolveWorkspaceSymbol
 
 /-- Ask for definitions at a position in an admitted document version. -/
-def Document.definitions (document : Document) (position : Lsp.Position) :
+def Document.definitions (document : Document) (position : Lsp.Position)
+    (timeoutMs : Nat := document.client.config.timeoutMs)
+    (cancel? : Option Std.CancellationToken := none) :
     EIO ClientError (Array DefinitionTarget) := do
-  let result ← document.request "textDocument/definition" <| Json.mkObj [
+  let params := Json.mkObj [
     ("textDocument", Json.mkObj [("uri", toJson document.uri)]), ("position", toJson position)]
+  let result ← document.request "textDocument/definition" params timeoutMs cancel?
   EIO.ofExcept <| (definitionTargets result).mapError ClientError.protocol
 
 /-- Decode semantic tokens against the opened text. An optional shared index
 must describe the text of this document version. -/
 def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := none)
-    (sourceIndex? : Option SourceIndex := none) :
+    (timeoutMs : Nat := document.client.config.timeoutMs)
+    (cancel? : Option Std.CancellationToken := none) (sourceIndex? : Option SourceIndex := none) :
     EIO ClientError (Array SemanticSpan) := do
+  if let some token := cancel? then
+    if ← token.isCancelled then throw <| ClientError.cancelled "textDocument/semanticTokens"
   let text ← document.text
   if sourceIndex?.any (·.text != text) then
     throw <| ClientError.invalidInput "semantic token source index does not match the document text"
@@ -77,7 +83,7 @@ def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := 
   let method := if useRange then "textDocument/semanticTokens/range" else "textDocument/semanticTokens/full"
   let params := [("textDocument", Json.mkObj [("uri", toJson document.uri)])]
   let params := if useRange then params ++ [("range", toJson range?)] else params
-  let result ← document.request method (Json.mkObj params)
+  let result ← document.request method (Json.mkObj params) timeoutMs cancel?
   let spans := match sourceIndex? with
     | some index => index.semanticSpans provider result
     | none => semanticSpans text provider result
@@ -87,11 +93,14 @@ def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := 
 the method in retainedNotificationMethods before startup. The caller owns
 server-specific readiness semantics; waiting is bounded. -/
 def Client.waitForNotification (client : Client) (method : String) (accept : Json → Bool)
-    (timeoutMs : Nat := 30000) : EIO ClientError Unit := do
+    (timeoutMs : Nat := 30000) (cancel? : Option Std.CancellationToken := none) :
+    EIO ClientError Unit := do
   unless client.config.retainedNotificationMethods.contains method do
     throw <| ClientError.invalidInput s!"notification method was not configured for retention: {method}"
   let deadline := (← IO.monoMsNow) + timeoutMs
   repeat
+    if let some token := cancel? then
+      if ← token.isCancelled then throw <| ClientError.cancelled method
     if let some params ← client.latestNotification method then
       if accept params then return
     if (← IO.monoMsNow) ≥ deadline then throw <| ClientError.deadline method
@@ -151,34 +160,48 @@ structure SourceExcerpt where
   pieces : Array HighlightedPiece
   deriving ToJson, FromJson
 
-/-- Read the exact source range. Return plain text when semantic tokens are unsupported. -/
-def Client.sourceExcerpt (client : Client) (languageId : String) (location : Lsp.Location) :
+/-- Read a range from this admitted version. The deadline and cancellation token
+apply to the semantic token request. Return plain text when tokens are unsupported. -/
+def Document.sourceExcerpt (document : Document) (range : Lsp.Range)
+    (timeoutMs : Nat := document.client.config.timeoutMs) (cancel? : Option Std.CancellationToken := none) :
     EIO ClientError SourceExcerpt := do
+  let languageId ← document.languageId
+  let text ← document.text
+  let index := SourceIndex.ofString text
+  let some (clampedRange, start, stop) := index.clampedByteRange? range
+    | throw <| ClientError.protocol "invalid source range"
+  let spans ← try
+    document.semanticTokens (some clampedRange) timeoutMs cancel? (sourceIndex? := some index)
+  catch error =>
+    match error with
+    | .unsupported _ => pure #[]
+    | _ => throw error
+  let mut pieces := #[]
+  let mut offset := start
+  for span in spans do
+    let some (left, right) := index.byteRange? span.range
+      | throw <| ClientError.protocol "invalid semantic token range"
+    let left := max start left
+    let right := min stop right
+    if left ≥ right then continue
+    if offset < left then
+      pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨left⟩ }
+    pieces := pieces.push {
+      text := String.Pos.Raw.extract text ⟨left⟩ ⟨right⟩
+      tokenType := span.tokenType, modifiers := span.modifiers }
+    offset := right
+  if offset < stop then pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨stop⟩ }
+  return { location := { uri := document.uri, range }, languageId, pieces }
+
+/-- Read a source range from a live overlay or an unopened local file, retaining
+the supplied location. The deadline and cancellation token apply to the semantic
+token request. Return plain text when tokens are unsupported. -/
+def Client.sourceExcerpt (client : Client) (languageId : String) (location : Lsp.Location)
+    (timeoutMs : Nat := client.config.timeoutMs) (cancel? : Option Std.CancellationToken := none) :
+    EIO ClientError SourceExcerpt :=
   withSourceDocument client location.uri languageId fun document => do
-    let text ← document.text
-    let index := SourceIndex.ofString text
-    let some (range, start, stop) := index.clampedByteRange? location.range
-      | throw <| ClientError.protocol "invalid source range"
-    let spans ← try document.semanticTokens (some range) (some index) catch error =>
-      match error with
-      | .unsupported _ => pure #[]
-      | _ => throw error
-    let mut pieces := #[]
-    let mut offset := start
-    for span in spans do
-      let some (left, right) := index.byteRange? span.range
-        | throw <| ClientError.protocol "invalid semantic token range"
-      let left := max start left
-      let right := min stop right
-      if left ≥ right then continue
-      if offset < left then
-        pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨left⟩ }
-      pieces := pieces.push {
-        text := String.Pos.Raw.extract text ⟨left⟩ ⟨right⟩
-        tokenType := span.tokenType, modifiers := span.modifiers }
-      offset := right
-    if offset < stop then pieces := pieces.push { text := String.Pos.Raw.extract text ⟨offset⟩ ⟨stop⟩ }
-    return { location, languageId, pieces }
+    let excerpt ← document.sourceExcerpt location.range timeoutMs cancel?
+    return { excerpt with location }
 
 /-- Look up a workspace symbol and read its indexed location. -/
 def Client.symbolSource (client : Client) (languageId name : String)

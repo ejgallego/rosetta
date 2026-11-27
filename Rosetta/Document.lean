@@ -109,6 +109,13 @@ def Bundle.find (bundle : Bundle) (request : Request) : Except String RequestSna
   unless snapshot.request == request do throw s!"analysis request changed: {request.key}"
   return snapshot
 
+/-- Index the authored text and check that each line has an origin. -/
+def Request.checkedSourceIndex (request : Request) : Except String SourceIndex := do
+  let index := SourceIndex.ofString request.text
+  unless request.origins.size == index.lineCount do
+    throw s!"invalid authored line map: {request.key}"
+  return index
+
 /-- Map each involved text line independently, retaining deindentation gaps. -/
 def Request.authoredLocations (request : Request) (range : Lsp.Range) :
     Except String (Array AuthoredLocation) := do
@@ -141,9 +148,7 @@ def Bundle.validate (bundle : Bundle) : Except String Unit := do
     if requestKeys.contains request.key then throw s!"duplicate snapshot: {request.key}"
     requestKeys := requestKeys.insert request.key
     unless contextKeys.contains request.context do throw s!"missing context: {request.context}"
-    let sourceIndex := SourceIndex.ofString request.text
-    unless request.origins.size == sourceIndex.lineCount do
-      throw s!"invalid authored line map: {request.key}"
+    let sourceIndex ← request.checkedSourceIndex
     if let .ok tokens := snapshot.tokens then
       sourceIndex.validateSemanticSpans tokens
     for query in snapshot.queries do

@@ -7,6 +7,8 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 def process_fields(pid):
@@ -103,6 +105,106 @@ def utf16_offset(text, position):
     return start + len(prefix.decode("utf-16-le"))
 
 
+class AnalysisPeer:
+    features = {"hold-tokens": "textDocument/semanticTokens/full",
+                "hold-hover": "textDocument/hover",
+                "hold-definition": "textDocument/definition"}
+    identifier = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+    def __init__(self, token_mode):
+        self.token_mode = token_mode
+        self.documents = {}
+        self.document_events = []
+        self.requests = []
+        self.held_diagnostics = False
+
+    def tokens(self, text):
+        data = []
+        previous_line, previous_character = 0, 0
+        for line_number, line in enumerate(text.split("\n")):
+            for match in self.identifier.finditer(line):
+                character = len(line[:match.start()].encode("utf-16-le")) // 2
+                token_type = 0 if match.group() in ("def", "check") else 1
+                delta = character - previous_character if line_number == previous_line else character
+                data.extend([line_number - previous_line, delta, len(match.group()), token_type, 0])
+                previous_line, previous_character = line_number, character
+        return data
+
+    def feature(self, method, request_id, params):
+        uri = params["textDocument"]["uri"]
+        text = self.documents[uri]
+        self.requests.append({"method": method, "id": request_id, "uri": uri,
+                              "position": params.get("position")})
+        if method == "textDocument/diagnostic":
+            if self.held_diagnostics:
+                reply(request_id, {"kind": "full", "items": []})
+            else:
+                self.held_diagnostics = True
+                send({"method": "test/analysis-held", "params": {}})
+            return
+        if method == self.features.get(self.token_mode):
+            send({"method": "test/analysis-held", "params": {}})
+            return
+        if self.token_mode == "delay-features":
+            time.sleep(0.25)
+        if method == "textDocument/semanticTokens/full":
+            assert self.token_mode != "none"
+            reply(request_id, {"data": self.tokens(text)})
+            return
+        position = utf16_offset(text, params["position"])
+        word = next(match.group() for match in self.identifier.finditer(text)
+                    if match.start() <= position < match.end())
+        if method == "textDocument/hover":
+            reply(request_id, {"contents": "mock hover " + word})
+            return
+        first = next(match for match in self.identifier.finditer(text) if match.group() == word)
+        before = text[:first.start()]
+        start = {"line": before.count("\n"),
+                 "character": len(before.rsplit("\n", 1)[-1].encode("utf-16-le")) // 2}
+        extent = {"start": start, "end": {**start, "character": start["character"] + len(word)}}
+        path = urlsplit(uri)
+        target_uri = Path(unquote(path.path)).resolve().as_uri() if path.scheme == "file" else uri
+        reply(request_id, [{"targetUri": target_uri, "targetRange": extent, "targetSelectionRange": extent}])
+
+    def handle(self, method, request_id, params):
+        if method == "initialize":
+            capabilities = {"positionEncoding": "utf-16", "textDocumentSync": 1,
+                            "hoverProvider": True, "definitionProvider": True,
+                            "diagnosticProvider": {"interFileDependencies": False,
+                                                   "workspaceDiagnostics": False}}
+            if self.token_mode != "none":
+                capabilities["semanticTokensProvider"] = {"full": True, "legend": {
+                    "tokenTypes": ["keyword", "function"], "tokenModifiers": []}}
+            reply(request_id, {"capabilities": capabilities})
+        elif method == "textDocument/didOpen":
+            document = params["textDocument"]
+            assert document["uri"] not in self.documents
+            self.documents[document["uri"]] = document["text"]
+            self.document_events.append([method, document["uri"]])
+        elif method == "textDocument/didChange":
+            uri = params["textDocument"]["uri"]
+            assert uri in self.documents
+            self.documents[uri] = params["contentChanges"][0]["text"]
+            self.document_events.append([method, uri])
+        elif method == "textDocument/didClose":
+            uri = params["textDocument"]["uri"]
+            del self.documents[uri]
+            self.document_events.append([method, uri])
+        elif method == "test/document-text":
+            reply(request_id, self.documents[params["textDocument"]["uri"]])
+        elif method == "test/analysis-state":
+            reply(request_id, {"pid": os.getpid(), "openUris": list(self.documents),
+                               "documentEvents": self.document_events, "requests": self.requests})
+        elif method == "textDocument/diagnostic" or method in self.features.values():
+            self.feature(method, request_id, params)
+        else:
+            return False
+        return True
+
+
+analysis_peer = None
+
+
 while True:
     headers = {}
     while True:
@@ -122,6 +224,12 @@ while True:
     method = message.get("method")
     request_id = message.get("id")
     params = message.get("params", {})
+    if method == "initialize":
+        options = params.get("initializationOptions") or {}
+        if options.get("mode") == "analysis":
+            analysis_peer = AnalysisPeer(options.get("tokenMode"))
+    if analysis_peer is not None and analysis_peer.handle(method, request_id, params):
+        continue
     if method == "initialize":
         options = params.get("initializationOptions") or {}
         mode = options.get("mode")
@@ -277,8 +385,14 @@ while True:
     elif method == "textDocument/didOpen":
         document_opens += 1
         document = params["textDocument"]
-        if mode == "incremental":
+        if mode in ("incremental", "scope"):
+            assert document["uri"] not in documents
             documents[document["uri"]] = document["text"]
+        if mode == "scope":
+            uri = Path(unquote(urlsplit(document["uri"]).path)).resolve().as_uri()
+            diagnostics(uri, document["version"], "current canonical warning")
+            diagnostics(uri, document["version"] - 1, "stale canonical warning")
+            continue
         diagnostics(document["uri"], document["version"], "old warning")
         diagnostics(document["uri"], document["version"])
         diagnostics(document["uri"], document["version"] - 1, "stale warning")
@@ -294,8 +408,22 @@ while True:
             documents[uri] = text
         diagnostics(document["uri"], 1, "stale after edit")
         diagnostics(document["uri"], document["version"], "current warning")
-    elif method == "textDocument/didClose" and mode == "incremental":
+    elif method == "textDocument/didClose" and mode in ("incremental", "scope"):
         del documents[params["textDocument"]["uri"]]
+    elif method == "test/scope-state":
+        reply(request_id, {"pid": os.getpid(), "documents": documents})
+    elif method == "test/scope-pause":
+        reply(request_id, True)
+        # Wait for the next frame without draining its oversized body.
+        assert sys.stdin.buffer.peek(1)
+        send({"method": "test/scope-write-started"})
+        deadline = time.monotonic() + 10
+        while not Path("resume").exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("scope test did not resume the peer")
+            time.sleep(0.005)
+    elif method == "test/scope-ping":
+        reply(request_id, True)
     elif method == "test/document-text":
         reply(request_id, documents[params["textDocument"]["uri"]])
     elif method == "test/workspace-traffic":

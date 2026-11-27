@@ -5,19 +5,95 @@ See the [package overview](../README.md) for installation, toolchain, and runtim
 
 ## The retained surface
 
-`import Rosetta` exposes the Lean/Std-only core. The main application operation
-is now:
+`import Rosetta` exposes the Lean/Std core. Call `analyze profiles requests`
+to start and close one language server for each context used in the request
+list. If you already own an initialized client, pass it to `analyzeWithClient`
+to run one profile's requests on that server.
 
 ```lean
-Rosetta.analyze : Array ContextProfile → Array Request → EIO ClientError Bundle
+import Rosetta
+open Rosetta
+
+def analyzeInSession (client : Client) (profile : ContextProfile)
+    (requests : Array Request) (cancel : Std.CancellationToken) : EIO ClientError Bundle :=
+  analyzeWithClient client profile requests {
+    maxQueriesPerCodeBlock := 0
+    requestTimeoutMs? := some 2000
+    cancel? := some cancel }
 ```
 
-Requests describe authored code or references and their source origins.
-Profiles provide language/server configuration, project membership, reference
-syntax, and `collectDiagnostics : Document → EIO ClientError DiagnosticEvidence`.
-Analysis owns the server scopes and returns portable snapshots. `Outcome.failed`
-inside a saved snapshot remains human-readable feature-failure text; live
-operational errors remain typed through analysis and profile callbacks.
+Both calls return a portable `Bundle`. The request list describes authored
+code blocks and references. The profile supplies the project document,
+reference syntax, and a `collectDiagnostics` callback. For live errors, callers
+can match on `ClientError`. Saved feature failures carry diagnostic text in
+`Outcome.failed`.
+
+### Session ownership
+
+`analyzeWithClient` requires every request to use the profile's context key.
+The profile's client configuration must match the initialized client's
+configuration after resolving the project root. The composed text is sent
+as an unsaved LSP overlay. A relative profile document path is resolved under
+the initialized client's project root.
+
+If the caller has that file open, Rosetta uses the URI from the caller's
+original `didOpen`. For example, a profile naming `./src/lib.rs` can borrow
+an overlay opened as `src/lib.rs`. A symlink to the file works the same way.
+Rosetta compares resolved local paths, so separate hard-link names remain
+distinct. An unsaved file can also be found through a symlink to its existing
+directory. If the path includes a dangling symlink, opening it returns
+`ClientError.invalidInput`. Use the target path to open the unsaved file.
+The language and composed text must match. A mismatch returns
+`ClientError.invalidInput` before Rosetta sends another `didOpen` or any
+feature requests. After analysis the caller can keep using the borrowed
+overlay. Rosetta sends `didClose` only for a document it opened itself.
+
+Borrowing checks the document version again when the callback returns. To run
+overlapping analyses on the same file, open the matching overlay yourself
+before starting either analysis. A temporary overlay belongs exclusively to
+the scope that opened it. A competing scope fails before its callback runs.
+Both kinds of callback receive a query-only `Document`. Use
+`document.sourceExcerpt range` inside the callback to read and highlight that
+version. To edit a file, retain the `OwnedDocument` returned by
+`client.openDocument`. Each successful `owner.change text` returns the owner
+of the new version. An edit or close invalidates borrowers of the old version.
+
+When the writer queue is full, a temporary scope waits up to the configured
+client timeout to enqueue `didClose`. If that expires, analysis returns
+`documentCleanup` and the client keeps the overlay reserved for cleanup.
+The error carries the wire URI and version of that scope. Once the queue drains,
+pass both directly to `client.retryDocumentClose uri version`. A later version of
+the same URI stays open if the caller retries an old error.
+
+### Analysis options
+
+Both analysis calls accept an optional `AnalysisOptions` argument.
+
+| Option | Effect |
+| --- | --- |
+| `maxQueriesPerCodeBlock` | Select up to this many eligible semantic token positions per code block for hover and definition requests. The default is 32. Zero still collects diagnostics and coloring, and authored references are queried separately. |
+| `requestTimeoutMs?` | Set a fresh deadline in milliseconds for each semantic token, hover, or definition request. The default uses the client's request timeout. |
+| `cancel?` | Check cancellation between phases and pass the token to the diagnostic callback and feature requests. A pre-cancelled call to `analyze` exits before launching a server. |
+
+A profile supplies `collectDiagnostics document cancel?`. Forward `cancel?`
+to diagnostic requests, `document.sourceExcerpt` when reading highlighted source,
+and `client.waitForNotification` when waiting for server readiness. A profile
+with its own polling loop must check the token in that loop. The profile chooses
+its diagnostic deadline. Server initialization and cleanup use their own
+lifecycle timeouts. Cancellation between phases reports
+`ClientError.cancelled "analysis"`. A cancelled feature request reports its
+LSP method. A document release failure preserves any original error inside
+`ClientError.documentCleanup`.
+
+A direct call to `Document.semanticTokens` with a pre-cancelled token returns
+`ClientError.cancelled "textDocument/semanticTokens"` before choosing the
+server's full or range method.
+
+The client accepts a versioned diagnostic under the canonical local file URI
+when the version matches the open overlay. An unversioned diagnostic must
+arrive under the original wire URI.
+
+### Client and document operations
 
 | Entry point | Contract |
 | --- | --- |
@@ -26,15 +102,17 @@ operational errors remain typed through analysis and profile callbacks.
 | `client.request method params timeoutMs cancel?` | Workspace/session RPC; return the JSON result or throw `ClientError` |
 | `client.notify method params` | Admit a workspace/session notification to the bounded queue |
 | `client.latestNotification method` | Observe retained params for a configured general notification method (`BaseIO`) |
-| `client.openDocument uri languageId text` | Return a handle for the admitted document version |
+| `client.openDocument uri languageId text` | Return an editable `OwnedDocument` for the supplied URI. A second open of the same local file returns `invalidInput`, including through a path alias. |
 | `client.withDocument uri languageId text action` | Own a scoped document or borrow an open overlay with matching language and text |
-| `client.document? uri` | Borrow the current handle if open |
+| `client.document? uri` | Return a query-only `Document` with its original wire URI, including when looking up a local file alias. |
 | `document.withBorrowed languageId action text?` | Run a callback on this exact admitted version and keep its overlay open. Optionally require matching text |
 | `document.text` | Read the exact text through a current versioned handle |
 | `document.request method params timeoutMs cancel?` | RPC with matching URI/version, checked at admission and delivery |
-| `document.change text` | Admit an edit and return its replacement handle |
+| `document.sourceExcerpt range timeoutMs cancel?` | Read the selected text and semantic coloring from this version |
+| `owner.change text` | Admit an edit and return the owner for the new version |
 | `document.diagnostics` | Read the snapshot through a current handle |
-| `document.close` | Close that version, rejecting stale handles |
+| `owner.close` | Close the owned version |
+| `client.retryDocumentClose uri version` | Retry release of a temporary scope whose close could not enter the writer queue |
 | `client.close` | Return a shared `CloseReport` in `BaseIO`, including incomplete cleanup |
 
 Fallible operations above use `EIO ClientError`. Deadlines and caller-owned
@@ -85,9 +163,11 @@ start of the declaration can take you to the definition of `MyType`. Named
 lookup therefore uses only the indexed location. The direct definition request
 returns all targets from the server, including an empty array or several targets.
 
-Use `client.sourceExcerpt languageId location` to read any `Lsp.Location`.
-When the document is open, Rosetta borrows its current overlay and checks
-that the language matches. A workspace symbol range carries no document
+Use `document.sourceExcerpt range` when you have a document handle.
+Use `client.sourceExcerpt languageId location` when you have an `Lsp.Location`.
+When the caller has the document open, Rosetta borrows its current overlay and
+checks that the language matches. A competing temporary scope returns
+`ClientError.invalidInput`. A workspace symbol range carries no document
 version, so an edit since indexing can change the text at that range. For an
 unopened local file URI without a query or fragment, Rosetta reads it from disk
 and opens a temporary document. Other URIs need an open overlay. A concurrent
@@ -102,6 +182,10 @@ tokens when range tokens are unavailable. It clips tokens at the excerpt boundar
 support or a null token result yields plain text. A caller explicitly requesting
 tokens with `document.semanticTokens range?` receives `ClientError.unsupported`
 when the requested operation is unavailable.
+
+Both excerpt helpers accept an optional `timeoutMs` and `cancel?` after their
+range or location. These control the semantic token request. The deadline
+defaults to the client's configured request timeout.
 
 Exact lookup reports `ClientError.invalidInput` if the name or supplied
 container is empty. `lookupSymbol` and `symbolSource` also report it when the
@@ -131,10 +215,11 @@ updates received during initialization. A newer busy status replaces an older
 ready status. The default retains no methods. There is no Rust-specific status
 field or API in the core.
 
-`Client.waitForNotification method predicate timeoutMs` requires that method in
+`Client.waitForNotification method predicate timeoutMs cancel?` requires that method in
 `retainedNotificationMethods`; otherwise it fails with `ClientError.invalidInput`.
-It waits on the retained value, independent of journal eviction, and reports
-`ClientError.deadline` if the predicate is not satisfied by the deadline. This
+It waits on the retained value, independent of journal eviction. It reports
+`ClientError.cancelled method` when the supplied token is cancelled and
+`ClientError.deadline` when the predicate misses its deadline. This
 changes the earlier journal-scanning helper: its callers must now configure the
 method before startup. These observations are snapshots, not session-liveness
 checks or a guarantee against subsequent indexing. The caller supplies the
@@ -162,7 +247,7 @@ names and containers without parsing language-specific syntax.
 | `protocol detail` | Malformed framing, JSON-RPC, or server feature data |
 | `io cause` | Original `IO.Error`, preserving its constructor and fields |
 | `server code message data?` | A valid server error response; arbitrary integer codes survive |
-| `documentCleanup uri cause original?` | Scoped document release failed, retaining any primary failure |
+| `documentCleanup uri version cause original?` | Scoped document release failed, retaining any primary failure |
 | `cleanup report original?` | Incomplete scoped cleanup, retaining any original typed failure |
 
 Absent server error data is `none`; explicit JSON null is `some Json.null`.
