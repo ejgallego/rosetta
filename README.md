@@ -32,14 +32,51 @@ lake test
 
 `lake test` runs the deterministic protocol, source-mapping, deadline,
 cancellation, and cleanup tests. Tests need Python 3 for the stdio mock peer;
-the library does not. Real-server probes expect the supplied fixture structure;
-first copy `tests/lsp/projects/rust` and `tests/lsp/projects/rocq` to temporary
-directories, then run them explicitly:
+the library needs only Lean and Std. Opt-in acceptance against rust-analyzer and coq-lsp
+uses pinned executable checksums and fixture revisions in
+[`tests/real_provers/pins.json`](tests/real_provers/pins.json). It copies fixtures
+to temporary projects and tests the public analysis API with repeated requests,
+Unicode source, hover, definition and local references, advertised coloring,
+and valid and invalid overlay diagnostics. It also checks overlay restoration,
+cancellation of a forwarded diagnostic request, reuse of the same client after
+cancellation, and process cleanup.
+
+Run the probe with Rust 1.89.0 and coq-lsp 0.2.4 with Rocq 9.1.0 on Linux x86-64.
 
 ```sh
-lake exe rosetta-spike probe rust /path/to/rust-analyzer /path/to/copied-rust-fixture
-lake exe rosetta-spike probe rocq /path/to/coq-lsp /path/to/copied-rocq-fixture
+python3 scripts/check_real_provers.py \
+  --rust-analyzer "$(rustup which rust-analyzer)" \
+  --rustc "$(rustup which rustc)" --cargo "$(rustup which cargo)" \
+  --coq-lsp "$HOME/.opam/rocq-v9.1/bin/coq-lsp" \
+  --rocq "$HOME/.opam/rocq-v9.1/bin/rocq" \
+  --output /tmp/rosetta-real-provers-evidence
 ```
+
+Pass the executable paths reported by `rustup which`. The runner checks
+exact `--version` output and SHA-256 before launching a server. These hashes
+identify the binaries from the tested installation. The pinned Rocq runtime
+and standard library must accompany coq-lsp.
+Evidence includes tool identity, analysis bundles, cleanup reports, and metadata
+from a transport recorder that records the forwarded diagnostic request and its
+matching `$/cancelRequest`.
+
+The optional `RosettaProverProfiles` library is separate from `Rosetta` and owns
+language policy. `Rosetta.ProverProfiles.rustProfile config key document` and
+`coqProfile` return `EIO ClientError ContextProfile`. `Config` takes `client`,
+`readinessTimeoutMs` (default 60000), and `provenance`. The document must be an
+existing member of the caller's project. The profiles preserve unrelated caller
+options while overriding their documented policy keys. Rust disables
+check-on-save, build scripts and proc macros. It observes cached process-wide
+quiescence, then pulls native diagnostics for the admitted overlay. It records
+the raw process status and the diagnostic document version. Rocq awaits
+`coq/getDocument` and current-version push diagnostics and retains its raw
+completion status, including stopped and failed results. Both profiles expose
+typed errors and honor the analysis cancellation token during bounded waits.
+
+Consumers can share `verify_tools`, `copy_fixtures`, and the
+`tool_environment(evidence)` context manager from the Python runner. Keep the
+context manager open through all sessions so they can resolve the verified
+executables and use the explicit `RUSTC` path.
 
 The client uses stdio transport and UTF-16 LSP positions. Process-group cleanup
 is currently validated on Linux and uses the standard Unix `kill` utility for
@@ -76,7 +113,8 @@ See the [API guide](doc/API.md) for sessions, handles, error constructors, and
 conversion to an application's `IO` boundary.
 
 For Verso authoring and rendering, use the separate
-[VersoRosetta package](verso/README.md).
+[VersoRosetta package](verso/README.md). It includes a runnable
+[analysis and offline replay example](verso/README.md#a-complete-runnable-workflow).
 
 See [migration notes](doc/MIGRATION.md) for consumers of the earlier VBP
 snapshot or the lean-mirror vendored patch, and [contributing](CONTRIBUTING.md)

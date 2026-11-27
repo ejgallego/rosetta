@@ -10,3 +10,11 @@ name = "Rosetta"
 name = "rosetta-spike"
 srcDir = "tests"
 root = "RosettaSpike"
+
+[[lean_lib]]
+name = "RosettaProverProfiles"
+
+[[lean_exe]]
+name = "rosetta-real-provers"
+srcDir = "tests"
+root = "RealProvers"

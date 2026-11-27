@@ -1436,11 +1436,14 @@ private def analysisInterruptionChecks (profile : ContextProfile) (code : Reques
 private def analysisDiagnosticInterruptionCheck (profile : ContextProfile) (code : Request) :
     EIO ClientError Unit := do
   let method := "textDocument/diagnostic"
-  let profile := { profile with collectDiagnostics := fun document cancel? => do
-    let params := Json.mkObj [("textDocument", Json.mkObj [("uri", toJson document.uri)])]
-    let result ← document.request method params (cancel? := cancel?)
-    let diagnostics ← IO.ofExcept <| result.getObjValAs? (Array Lsp.Diagnostic) "items"
-    return { coverage := "pull", diagnostics } }
+  let options := profile.client.initializationOptions.mergeObj (Json.mkObj [("holdFirstDiagnostic", toJson true)])
+  let profile := { profile with
+    client := { profile.client with initializationOptions := options }
+    collectDiagnostics := fun document cancel? => do
+      let params := Json.mkObj [("textDocument", Json.mkObj [("uri", toJson document.uri)])]
+      let result ← document.request method params (cancel? := cancel?)
+      let diagnostics ← IO.ofExcept <| result.getObjValAs? (Array Lsp.Diagnostic) "items"
+      return { coverage := "pull", diagnostics } }
   Client.withSession profile.client fun client => do
     let cancel ← Std.CancellationToken.new
     let task ← EIO.asTask (analyzeWithClient client profile #[code] { cancel? := some cancel }) .dedicated
