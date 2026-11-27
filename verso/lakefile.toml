@@ -17,6 +17,7 @@ name = "VersoRosetta"
 [[lean_exe]]
 name = "VersoRosettaTests"
 srcDir = "tests"
+needs = ["rosetta-workflow"]
 
 [[lean_lib]]
 name = "RosettaWorkflow"

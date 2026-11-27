@@ -21,7 +21,7 @@ class Page(HTMLParser):
         self.spans = []
         self.current_span = None
         self.link_stack = []
-        self.feed(path.read_text())
+        self.feed(path.read_text(encoding="utf-8"))
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -62,53 +62,61 @@ class Page(HTMLParser):
             self.current_span[1] += data
 
 
+def local_target(parsed):
+    assert not parsed.scheme and not parsed.netloc, parsed.geturl()
+    # Manual's base element resolves site-relative links from the root.
+    path = Path(unquote(parsed.path))
+    if parsed.path.endswith("/") or not parsed.path:
+        path /= "index.html"
+    return path, unquote(parsed.fragment)
+
+
+def rendered_files(root):
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
 def check(output):
-    single = Page(output / "html-single/index.html")
-    assert len(single.panels) == 2 and len(set(single.panels)) == 2, single.panels
-    assert len(single.ids) == len(set(single.ids)), "duplicate single-page IDs"
-    assert single.code.count("def sample := 1\n") == 2, single.code
-    assert single.code.count("sample") == 2, single.code
     for mode in ("html-single", "html-multi"):
-        root = output / mode
+        analyzed = rendered_files(output / "analyzed" / mode)
+        replayed = rendered_files(output / "replayed" / mode)
+        assert analyzed and analyzed == replayed, f"live and replayed {mode} output differ"
+        root = output / "escaped" / mode
         pages = {p.relative_to(root): Page(p) for p in root.rglob("*.html")}
-        docs = json.loads((root / "-verso-docs.json").read_text())
+        if mode == "html-single":
+            first = Path("index.html")
+            page = pages[first]
+            assert len(page.panels) == 2 and len(set(page.panels)) == 2, page.panels
+            assert page.code.count("def sample := 1\n") == 2, page.code
+            assert page.code.count("sample") == 2, page.code
+        else:
+            first = Path("first/index.html")
+            first_page = pages[first]
+            second = pages[Path("second/index.html")]
+            assert len(first_page.panels) == len(second.panels) == 1
+            assert len(first_page.references) == len(second.references) == 1
+            assert second.hovers, "missing second-page reference"
+        expected_target = first, pages[first].panels[0]
+        docs = json.loads((root / "-verso-docs.json").read_text(encoding="utf-8"))
         hover_ids = [h for page in pages.values() for h in page.hovers]
         assert hover_ids, "missing hover attributes"
         for hover in hover_ids:
             content = docs[int(hover)] if isinstance(docs, list) else docs[hover]
             assert "&lt;script&gt;" in content and "<script>" not in content, content
-        targets = set()
         for path, page in pages.items():
             assert len(page.ids) == len(set(page.ids)), f"duplicate IDs in {path}"
             for href in page.links:
                 parsed = urlsplit(href)
-                if not parsed.fragment.startswith("rosetta-"):
-                    continue
-                assert not parsed.scheme, href
-                # Manual's base element resolves site-relative links from the root.
-                target_path = Path(unquote(parsed.path))
-                if parsed.path.endswith("/") or not parsed.path:
-                    target_path /= "index.html"
-                assert target_path in pages, href
-                assert unquote(parsed.fragment) in pages[target_path].ids, href
-                targets.add((str(target_path), unquote(parsed.fragment)))
-        assert len(targets) == 1, f"local links must select the first occurrence: {targets}"
+                if parsed.fragment.startswith("rosetta-"):
+                    assert local_target(parsed) == expected_target, (path, href, expected_target)
         references = [links for page in pages.values() for links in page.references]
         assert len(references) == 2, references
         for links in references:
             assert len(links) == 1, f"reference must have exactly one definition link: {links}"
-            parsed = urlsplit(links[0])
-            path = Path(unquote(parsed.path))
-            if parsed.path.endswith("/") or not parsed.path:
-                path /= "index.html"
-            assert (str(path), unquote(parsed.fragment)) == next(iter(targets)), links
-        if mode == "html-multi":
-            assert next(iter(targets))[0] == "first/index.html", targets
-            assert pages[Path("second/index.html")].hovers, "missing second-page reference"
+            assert local_target(urlsplit(links[0])) == expected_target, (links, expected_target)
     unicode = Page(output / "unicode/html-single/index.html")
     assert unicode.code == ["😀sample <>&\n  βeta\n"], unicode.code
     assert [text for classes, text in unicode.spans if "lsp-function" in classes] == ["sample"], unicode.spans
-    print("Replay, repeated IDs, cross-page links, hover escaping and Unicode HTML passed")
+    print("Byte-identical replay, repeated IDs, first-occurrence links, hover escaping and Unicode HTML passed")
 
 
 if __name__ == "__main__":

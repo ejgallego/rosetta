@@ -12,10 +12,12 @@ lake build
 lake test
 ```
 
-The tests compile foreign code/reference authoring and run the complete workflow
-against the repository's deterministic Python mock. They check saved-data replay,
-source origins, repeated IDs, cross-page links, Unicode text and escaped hover
-content in generated HTML. The tests and mock example require Python 3.
+The tests compile foreign code/reference authoring and run the workflow CLI
+against the repository's deterministic Python mock. They compare the live and
+saved-bundle HTML output byte for byte with `PATH` pointing to an empty directory
+during replay. They also check source origins, repeated IDs, definition links to
+the first code panel in both output modes, Unicode text and escaped hover content.
+The tests and mock example require Python 3.
 
 ## A complete runnable workflow
 

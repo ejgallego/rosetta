@@ -68,7 +68,7 @@ def loadBundle (file : System.FilePath) : IO Bundle := do
   IO.ofExcept bundle.validate
   return bundle
 
-/-- Offline stage: only saved evidence and compiled requests are consulted. -/
+/-- Attach saved analysis to the compiled document and run Verso's Manual renderer. -/
 def render (bundle : Bundle) (output : System.FilePath) : IO UInt32 := do
   let enriched ← IO.ofExcept <| enrich bundle document
   manualMain enriched (options := []) (config := {

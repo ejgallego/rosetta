@@ -26,6 +26,11 @@ jobs:
           build: true
           test: true
           use-github-cache: false
+      - name: Build real prover acceptance targets
+        run: nice -n 10 lake build RosettaProverProfiles rosetta-real-provers
+      - name: Check real prover runner with mock tools
+        if: matrix.toolchain == 'v4.35.0'
+        run: python3 tests/check_real_prover_harness.py
   verso:
     runs-on: ubuntu-latest
     steps:
