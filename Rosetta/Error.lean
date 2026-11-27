@@ -53,7 +53,7 @@ inductive ClientError where
   | protocol (detail : String)
   | io (cause : IO.Error)
   | server (code : Int) (message : String) (data? : Option Json)
-  | documentCleanup (uri : String) (cause : ClientError) (original? : Option ClientError)
+  | documentCleanup (uri : String) (version : Int) (cause : ClientError) (original? : Option ClientError)
   | cleanup (report : CloseReport) (original? : Option ClientError)
 
 partial def ClientError.toString : ClientError → String
@@ -71,8 +71,8 @@ partial def ClientError.toString : ClientError → String
     | .io cause => cause.toString
     | .server code message data? =>
       s!"server error {code}: {message}" ++ (data?.map (fun data => s!" ({data.compress})") |>.getD "")
-    | .documentCleanup uri cause original? =>
-      let detail := s!"document cleanup failed for {uri}: {ClientError.toString cause}"
+    | .documentCleanup uri version cause original? =>
+      let detail := s!"document cleanup failed for {uri} at version {version}: {ClientError.toString cause}"
       original?.map (fun original => s!"{ClientError.toString original}; {detail}") |>.getD detail
     | .cleanup report original? =>
       let cleanup := s!"session cleanup incomplete: {repr report}"
