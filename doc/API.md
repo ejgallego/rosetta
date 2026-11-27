@@ -121,8 +121,9 @@ capabilities, stderr, and notification observations are `BaseIO` operations.
 `document.client` is a plain accessor for session-wide readiness observations;
 it does not replace versioned document admission.
 
-Manual start/close and scoped ownership are both retained because they cover
-different lifetimes. Workspace and document requests remain separate because
+A caller that manages its own session can inspect the close report, then use
+`report.finish result` to combine it with the action’s `Except ClientError α`.
+This preserves the original error if cleanup also failed, as `withSession` does. Workspace and document requests remain separate because
 only the latter carry a versioned document handle.
 
 Source composition (`compose`, `Projection.mapRange`), portable bundle
@@ -202,7 +203,7 @@ Client.withSession { config with
     experimentalCapabilities := config.experimentalCapabilities.mergeObj
       (Json.mkObj [("serverStatusNotification", toJson true)])
     retainedNotificationMethods := config.retainedNotificationMethods.push "experimental/serverStatus" } fun client => do
-  client.waitForNotification "experimental/serverStatus" (fun status =>
+  let _ ← client.waitForNotification "experimental/serverStatus" (fun status =>
     (status.getObjValAs? Bool "quiescent").toOption == some true) 30000
   client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")
 ```
@@ -217,13 +218,12 @@ field or API in the core.
 
 `Client.waitForNotification method predicate timeoutMs cancel?` requires that method in
 `retainedNotificationMethods`; otherwise it fails with `ClientError.invalidInput`.
-It waits on the retained value, independent of journal eviction. It reports
-`ClientError.cancelled method` when the supplied token is cancelled and
-`ClientError.deadline` when the predicate misses its deadline. This
-changes the earlier journal-scanning helper: its callers must now configure the
-method before startup. These observations are snapshots, not session-liveness
-checks or a guarantee against subsequent indexing. The caller supplies the
-server-specific predicate and experimental capabilities needed to enable it.
+It returns the retained JSON params that satisfied the predicate, independent
+of journal eviction. It reports `ClientError.cancelled method` when the
+supplied token is cancelled and `ClientError.deadline` when the predicate
+misses its deadline. The caller configures the method before startup and supplies
+its readiness predicate and any experimental capabilities. The returned params
+describe the observed status at the time of the wait.
 
 `Client.notifications` independently retains the latest 512 general notifications
 with an eviction count. Diagnostics remain in `Document.diagnostics`, outside

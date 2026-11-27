@@ -843,20 +843,13 @@ def Client.start (config : ClientConfig) : EIO ClientError Client := do
     return client
   catch error =>
     let report ← client.close
-    if report.complete then throw error
-    throw <| ClientError.cleanup report (some error)
+    EIO.ofExcept <| report.finish (.error error)
 
 /-- Preserve the action's failure if cleanup also fails. -/
 def Client.withSession (config : ClientConfig) (action : Client → EIO ClientError α) : EIO ClientError α := do
   let client ← Client.start config
-  let result : Except ClientError α ← try pure (.ok (← action client)) catch error => pure (.error error)
+  let result ← (action client).toBaseIO
   let report ← client.close
-  match result with
-  | .ok value =>
-    unless report.complete do throw <| ClientError.cleanup report none
-    return value
-  | .error error =>
-    if report.complete then throw error
-    throw <| ClientError.cleanup report (some error)
+  EIO.ofExcept <| report.finish result
 
 end Rosetta

@@ -3,9 +3,7 @@ Copyright (c) 2026 Lean FRO LLC. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 Author: Emilio J. Gallego Arias
 -/
-import Rosetta
-import Rosetta.Client
-import Rosetta.Source
+import RosettaProverProfiles
 
 open Lean Rosetta
 
@@ -549,50 +547,64 @@ private def queryParams (uri : String) (line character : Nat) : Json := Json.mkO
   ("textDocument", Json.mkObj [("uri", toJson uri)]),
   ("position", toJson (⟨line, character⟩ : Lsp.Position))]
 
-private def rocqDocument (document : Document) : EIO ClientError Json :=
-  document.request "coq/getDocument" <| Json.mkObj [("textDocument", Json.mkObj [
-    ("uri", toJson document.uri), ("version", toJson document.version)])]
-
-private def pushDiagnostics (document : Document) :
-    EIO ClientError (Array Lsp.Diagnostic) := do
-  let deadline := (← IO.monoMsNow) + 3000
-  repeat
-    if let some snapshot ← document.diagnostics then
-      if snapshot.version? == some document.version then return snapshot.diagnostics
-    check ((← IO.monoMsNow) < deadline) "missing current-version push diagnostics"
-    IO.sleep 2
-  throw <| ClientError.io <| IO.userError "unreachable diagnostics loop"
-
-private def pullDiagnostics (document : Document) : EIO ClientError (Array Lsp.Diagnostic) := do
-  let report ← document.request "textDocument/diagnostic" <| Json.mkObj [
-    ("textDocument", Json.mkObj [("uri", toJson document.uri)])]
-  IO.ofExcept <| report.getObjValAs? (Array Lsp.Diagnostic) "items"
+open ProverProfiles in
+private def profileChecks : EIO ClientError Unit := do
+  let options := Json.mkObj [
+    ("checkOnSave", toJson true),
+    ("custom", toJson "preserved"),
+    ("cargo", Json.mkObj [("features", toJson #["custom-feature"]), ("buildScripts", Json.mkObj [
+      ("invocationStrategy", toJson "per_workspace"), ("enable", toJson true)])]),
+    ("diagnostics", Json.mkObj [("enable", toJson false), ("disabled", toJson #["example"])])]
+  let config : Config := { client := {
+    command := "unused", root := ".", initializationOptions := options
+    experimentalCapabilities := Json.mkObj [("customExtension", toJson true), ("serverStatusNotification", toJson false)] } }
+  let rust ← rustProfile config "rust" "src/lib.rs"
+  let actual := rust.client.initializationOptions
+  let scripts := (actual.getObjValD "cargo").getObjValD "buildScripts"
+  let diagnosticOptions := actual.getObjValD "diagnostics"
+  check (actual.getObjValD "custom" == toJson "preserved" &&
+    (actual.getObjValD "cargo").getObjValD "features" == toJson #["custom-feature"] &&
+    scripts.getObjValD "invocationStrategy" == toJson "per_workspace" &&
+    scripts.getObjValD "enable" == toJson false &&
+    actual.getObjValD "checkOnSave" == toJson false &&
+    diagnosticOptions.getObjValD "enable" == toJson true &&
+    diagnosticOptions.getObjValD "disabled" == toJson #["example"] &&
+    rust.client.experimentalCapabilities.getObjValD "customExtension" == toJson true &&
+    rust.client.experimentalCapabilities.getObjValD "serverStatusNotification" == toJson true)
+    "Rust profile discarded caller configuration or failed to apply its policy"
+  for (reference, offset) in #[("αλφα::step", "αλφα::".utf8ByteSize), ("math::β", 6),
+      ("::math::r#type", 8), ("step(x::y)", 0)] do
+    check (rust.referenceQueryOffset reference == offset) s!"incorrect Rust reference offset: {reference}"
+  let coqOptions := Json.mkObj [("check_only_on_request", toJson true),
+    ("eager_diagnostics", toJson true), ("send_diags", toJson false), ("max_errors", toJson (0 : Nat))]
+  let coq ← coqProfile { config with client := { config.client with initializationOptions := coqOptions } }
+    "rocq" "Probe.v"
+  let actual := coq.client.initializationOptions
+  check (actual.getObjValD "max_errors" == toJson (0 : Nat) &&
+    actual.getObjValD "check_only_on_request" == toJson false &&
+    actual.getObjValD "eager_diagnostics" == toJson false &&
+    actual.getObjValD "send_diags" == toJson true)
+    "Rocq profile discarded the error limit or failed to apply its diagnostic policy"
+  let invalid ← (rustProfile { config with client := { config.client with initializationOptions := toJson true } }
+    "rust" "src/lib.rs").toBaseIO
+  check (invalid matches .error (.invalidInput _)) "malformed profile options lost typed error"
 
 private def probe (language command root : String) : EIO ClientError Unit := do
   let root ← IO.FS.realPath root
-  let file := root / if language == "rust" then "src/lib.rs" else "Probe.v"
+  let config : ProverProfiles.Config := { client := { command, root, timeoutMs := 15000 } }
+  let profile ← match language with
+    | "rust" => ProverProfiles.rustProfile config language "src/lib.rs"
+    | "rocq" => ProverProfiles.coqProfile config language "Probe.v"
+    | _ => throw <| ClientError.invalidInput s!"unknown probe language: {language}"
+  let file := root / profile.document
   let text ← IO.FS.readFile file
   let uri := (System.Uri.pathToUri file : String)
-  let client ← Client.start {
-    command, root, timeoutMs := 15000
-    initializationOptions := if language == "rust" then
-      Json.mkObj [("checkOnSave", toJson false), ("cargo", Json.mkObj [("buildScripts", Json.mkObj [("enable", toJson false)])]),
-        ("procMacro", Json.mkObj [("enable", toJson false)])]
-    else Json.mkObj [("check_only_on_request", toJson false)] }
-  try
-    let mut document ← client.openDocument uri (if language == "rust" then "rust" else "coq") text
-    -- Each bounded query is retried only for transient startup evidence in this
-    -- experiment. The library itself has no success-by-retry policy.
+  Client.withSession profile.client fun client => do
+    let mut document ← client.openDocument uri profile.languageId text
+    let baseline ← profile.collectDiagnostics document none
     let (line, character) := if language == "rust" then (7, 32) else (6, 7)
-    let mut result := Json.null
-    let mut targets := #[]
-    for _ in [:20] do
-      try
-        result ← document.request "textDocument/definition" (queryParams uri line character) 3000
-        targets ← IO.ofExcept <| definitionTargets result
-      catch _ => pure ()
-      if !targets.isEmpty then break
-      IO.sleep 100
+    let result ← document.request "textDocument/definition" (queryParams uri line character)
+    let targets ← IO.ofExcept <| definitionTargets result
     let hover ← document.request "textDocument/hover" (queryParams uri line character)
     let (blockLine, blockCharacter) := if language == "rust" then (4, 36) else (2, 20)
     let blockDefinition ← document.request "textDocument/definition" (queryParams uri blockLine blockCharacter)
@@ -601,17 +613,11 @@ private def probe (language command root : String) : EIO ClientError Unit := do
       target.uri == block.uri && target.selectionRange == block.selectionRange)
       "block and named reference did not resolve to the same declaration"
     let caps ← client.capabilities
-    let mut spans : Array SemanticSpan := #[]
-    if let .ok provider := caps.getObjVal? "semanticTokensProvider" then
-      let tokens ← document.request "textDocument/semanticTokens/full" <| Json.mkObj [
-        ("textDocument", Json.mkObj [("uri", toJson uri)])]
-      spans ← IO.ofExcept <| semanticSpans text provider tokens
+    let spans ← if caps.getObjValD "semanticTokensProvider" == .null then pure #[] else do
+      let spans ← document.semanticTokens
       check (!spans.isEmpty) "server advertised semantic tokens but returned no spans"
-    let mut completion := Json.null
-    if language == "rocq" then completion ← rocqDocument document
-    let baselineDiagnostics ← if language == "rust" then pullDiagnostics document
-      else pushDiagnostics document
-    check (!(baselineDiagnostics.any (·.severity? == some .error))) "valid authored block has errors"
+      pure spans
+    check (!(baseline.diagnostics.any (·.severity? == some .error))) "valid authored block has errors"
 
     -- Analyze an unsaved invalid fragment in the real project. The prefix is
     -- generated context; only the fragment has an authored-source location.
@@ -621,23 +627,18 @@ private def probe (language command root : String) : EIO ClientError Unit := do
     let projection ← IO.ofExcept <| compose #[.generated (text ++ "\n"),
       .source { uri := "verso-source://spike/invalid", source := invalidSource, range := invalidSource.fullRange }]
     document ← document.change projection.text
-    let mut invalidCompletion := Json.null
-    if language == "rocq" then invalidCompletion ← rocqDocument document
-    let invalidDiagnostics ← if language == "rust" then pullDiagnostics document
-      else pushDiagnostics document
-    let invalidHasError := invalidDiagnostics.any (·.severity? == some .error)
+    let errors ← profile.collectDiagnostics document none
+    let invalidHasError := errors.diagnostics.any (·.severity? == some .error)
     let mut mappedLocations := #[]
-    for diagnostic in invalidDiagnostics do
+    for diagnostic in errors.diagnostics do
       let (_, mapped) ← IO.ofExcept <| projection.mapServerRange diagnostic.range
       for location in mapped.locations do
         mappedLocations := mappedLocations.push <| Json.mkObj [
           ("uri", toJson location.uri), ("range", toJson location.range),
           ("message", toJson diagnostic.message)]
     document ← document.change text
-    if language == "rocq" then discard <| rocqDocument document
-    let restoredDiagnostics ← if language == "rust" then pullDiagnostics document
-      else pushDiagnostics document
-    check (!(restoredDiagnostics.any (·.severity? == some .error))) "error survived document restoration"
+    let restored ← profile.collectDiagnostics document none
+    check (!(restored.diagnostics.any (·.severity? == some .error))) "error survived document restoration"
 
     let mut detachedDefinition := Json.null
     if language == "rust" then
@@ -651,9 +652,9 @@ private def probe (language command root : String) : EIO ClientError Unit := do
       ("language", toJson language), ("capabilities", caps),
       ("definition", result), ("targets", toJson targets), ("hover", hover),
       ("blockDefinition", blockDefinition), ("semanticSpans", toJson spans),
-      ("baselineDiagnostics", toJson baselineDiagnostics), ("completion", completion),
-      ("invalidCompletion", invalidCompletion), ("invalidDiagnostics", toJson invalidDiagnostics),
-      ("mappedDiagnostics", toJson mappedLocations), ("restoredDiagnostics", toJson restoredDiagnostics),
+      ("baselineDiagnostics", toJson baseline.diagnostics), ("completion", baseline.completion),
+      ("invalidCompletion", errors.completion), ("invalidDiagnostics", toJson errors.diagnostics),
+      ("mappedDiagnostics", toJson mappedLocations), ("restoredDiagnostics", toJson restored.diagnostics),
       ("detachedDefinition", detachedDefinition),
       ("diagnostics", toJson diagnostics), ("notifications", toJson notifications),
       ("droppedNotifications", toJson dropped), ("stderr", toJson (← client.stderr))]
@@ -662,9 +663,6 @@ private def probe (language command root : String) : EIO ClientError Unit := do
     check (!mappedLocations.isEmpty) "real diagnostic did not map to the authored fragment"
     check (!targets.isEmpty) s!"{language}: no definition targets"
     check (hover != Json.null) s!"{language}: no hover"
-  finally
-    check (← client.close).complete s!"{language}: process was not reaped"
-
 
 private def assertCheck (condition : Bool) (message : String) : EIO ClientError Unit :=
   unless condition do throw <| ClientError.invalidInput message
@@ -1064,8 +1062,9 @@ def workspaceChecks (server : String) : EIO ClientError Unit :=
       assertCheck ((traffic.getObjValAs? Nat "definitionRequests").toOption == some 2)
         s!"workspace helpers sent additional definition requests: {traffic}"
       discard <| client.request "test/readiness" (Json.mkObj [])
-      client.waitForNotification "test/status" (fun params =>
+      let matched ← client.waitForNotification "test/status" (fun params =>
         (params.getObjValAs? Bool "ready").toOption == some true) 1000
+      assertCheck (matched.getObjValD "ready" == toJson true) "wait lost the matching status"
       let (notifications, dropped) ← client.notifications
       assertCheck (notifications.size == 512 && dropped > 0) "notification trace was not bounded"
       assertCheck (!(notifications.any fun message =>
@@ -1631,7 +1630,7 @@ def main (args : List String) : IO Unit := do
   | ["mock", server] =>
     pureChecks
     bundleChecks
-    (localDefinitionChecks server *> mockChecks server *> scopeChecks server *>
+    (profileChecks *> localDefinitionChecks server *> mockChecks server *> scopeChecks server *>
       analysisFailureChecks server *> analysisChecks server *> workspaceChecks server).toIO (IO.userError ∘ toString)
   | ["probe", language, command, root] => (probe language command root).toIO (IO.userError ∘ toString)
   | _ => throw <| IO.userError "usage: rosetta-spike mock SERVER.py | probe LANGUAGE COMMAND ROOT"

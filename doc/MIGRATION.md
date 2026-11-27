@@ -37,9 +37,10 @@ messages received during initialization. Diagnostics remain on document handles.
 
 `Client.waitForNotification` now requires the method to be configured for
 retention before startup; otherwise it returns `ClientError.invalidInput`.
-The generic core contains no Rust-specific status field. Readiness is a
-server-specific observation, not a liveness check or a promise against later
-indexing work. See [API](API.md) for the complete contract.
+It returns `EIO ClientError Json` containing the params that satisfied the
+predicate. Use `let status ← client.waitForNotification …` when saving
+readiness evidence, or `let _ ← client.waitForNotification …` when continuing
+after the observation is enough. See [API](API.md) for the complete contract.
 
 ## Document boundary hardening (bundle revision 2)
 

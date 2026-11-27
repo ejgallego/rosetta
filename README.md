@@ -36,10 +36,9 @@ the library needs only Lean and Std. Opt-in acceptance against rust-analyzer and
 uses pinned executable checksums and fixture revisions in
 [`tests/real_provers/pins.json`](tests/real_provers/pins.json). It copies fixtures
 to temporary projects and tests the public analysis API with repeated requests,
-Unicode source, hover, definition and local references, advertised coloring,
-and valid and invalid overlay diagnostics. It also checks overlay restoration,
-cancellation of a forwarded diagnostic request, reuse of the same client after
-cancellation, and process cleanup.
+Unicode source, hover, definitions, semantic coloring, and valid and invalid
+overlays. It checks cancellation and reuse on the same connection, then verifies
+process cleanup.
 
 Run the probe with Rust 1.89.0 and coq-lsp 0.2.4 with Rocq 9.1.0 on Linux x86-64.
 
@@ -56,22 +55,32 @@ Pass the executable paths reported by `rustup which`. The runner checks
 exact `--version` output and SHA-256 before launching a server. These hashes
 identify the binaries from the tested installation. The pinned Rocq runtime
 and standard library must accompany coq-lsp.
-Evidence includes tool identity, analysis bundles, cleanup reports, and metadata
-from a transport recorder that records the forwarded diagnostic request and its
-matching `$/cancelRequest`.
+The runner copies the files listed in the fixture manifest into temporary
+projects. Its evidence includes tool identity, analysis bundles, cleanup
+reports, and a transport trace with request and cancellation IDs.
+If a probe times out or the runner receives `SIGINT` or `SIGTERM`, the Linux
+runner terminates the probe and reaps its remaining descendants before removing
+the temporary projects. The output directory retains any evidence written by
+that point.
 
-The optional `RosettaProverProfiles` library is separate from `Rosetta` and owns
-language policy. `Rosetta.ProverProfiles.rustProfile config key document` and
-`coqProfile` return `EIO ClientError ContextProfile`. `Config` takes `client`,
-`readinessTimeoutMs` (default 60000), and `provenance`. The document must be an
-existing member of the caller's project. The profiles preserve unrelated caller
-options while overriding their documented policy keys. Rust disables
-check-on-save, build scripts and proc macros. It observes cached process-wide
-quiescence, then pulls native diagnostics for the admitted overlay. It records
-the raw process status and the diagnostic document version. Rocq awaits
-`coq/getDocument` and current-version push diagnostics and retains its raw
-completion status, including stopped and failed results. Both profiles expose
-typed errors and honor the analysis cancellation token during bounded waits.
+The optional `RosettaProverProfiles` library supplies two profiles for an
+existing member of a project. Pass a `Rosetta.ProverProfiles.Config` with the
+client configuration, optional provenance, and a readiness timeout (60 seconds
+by default) to `rustProfile config key document` or `coqProfile config key document`.
+
+- The Rust profile enables native diagnostics and disables check-on-save, build
+  scripts, and proc macros. It records the process-wide status that satisfied
+  its quiescence check and pulls diagnostics for the admitted overlay. A
+  qualified reference such as `arithmetic::step` selects `step`. A caller can
+  set `ContextProfile.referenceQueryOffset` to choose the position in a more
+  complex expression.
+- The Rocq profile enables final diagnostic publications and disables eager
+  intermediate ones. It waits for diagnostics for the admitted document
+  version, including an empty set, then calls `coq/getDocument` for the
+  terminal result. This preserves both successful completion and failure when
+  Rocq reaches its error limit.
+
+Both profiles forward cancellation through their waits and requests.
 
 Consumers can share `verify_tools`, `copy_fixtures`, and the
 `tool_environment(evidence)` context manager from the Python runner. Keep the
