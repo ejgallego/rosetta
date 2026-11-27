@@ -79,3 +79,46 @@ On Linux, session close checks the owned process group through readable procfs
 before reaping its leader. Descendants with redirected stdio require
 termination and set `CloseReport.forced`. Inspection and termination errors
 appear in `CloseReport.errors`.
+
+## Named symbols and source excerpts
+
+Pass the exact symbol name and optional server-reported container separately.
+For example, replace `client.sourceDefinition "rust" "Container::measure" "::"`
+with `client.symbolSource "rust" "measure" (container? := some "Container")`.
+For an unqualified name, omit `container?`.
+
+| Previous API | Replacement |
+| --- | --- |
+| `Client.workspaceDefinition` | Call `client.lookupSymbol name (container? := some container)` for the indexed `Lsp.Location`. Lookup no longer takes a language ID. |
+| `Client.highlightDefinition` | Pass an `Lsp.Location` to `client.sourceExcerpt languageId`. For a `DefinitionTarget` named `target`, pass `{ uri := target.uri, range := target.range }`. |
+| `Client.sourceDefinition` | Call `client.symbolSource languageId name` with an optional container for the source excerpt at the indexed range. |
+| `HighlightedDefinition` | Both excerpt helpers return `SourceExcerpt`, with `location`, `languageId`, and `pieces`. Regenerate saved values that used the old JSON shape. |
+
+The workspace index determines the extent of a named excerpt. If an application
+needs Go to Definition, call `document.definitions position` at a known
+reference and select the target to display. Missing token support gives a
+plain excerpt. Explicit `document.semanticTokens` requests still report
+unsupported operations.
+
+Use `client.lookupSymbols name container?` when the caller wants to handle an
+empty result or select from multiple exact matches. It returns distinct indexed
+locations in server order. `lookupSymbol` and `symbolSource` require a single
+location.
+
+Source excerpts and live diagnostics clamp oversized UTF-16 columns to the
+end of the line. Saved request spans must already have valid UTF-16 ranges.
+An excerpt keeps the original supplied location. CR, LF and CRLF each count as
+one line ending. When building requests directly, supply one authored origin
+per LSP line, including the final empty line after a terminator.
+
+## Composing source slices
+
+Create one `SourceIndex.ofString text` for each version of an input. Pass that
+value as `SourceRange.source` to every slice of the same text. For a whole
+input, use `index.fullRange`. This lets a projection retain one line index
+when a deindented block has a separate slice for each line.
+
+For a diagnostic or definition range received from a server, use
+`projection.mapServerRange range`. It returns the normalized range in the
+composed document and the corresponding source locations. Use
+`projection.mapRange range` for a range that already uses exact coordinates.

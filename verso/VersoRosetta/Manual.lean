@@ -130,26 +130,41 @@ instance : Verso.ArgParse.FromArgs ReferenceConfig m where
     .positional `key .string <*> .positional `written (.withSyntax .string) <*> .named' `context false
 end
 
+private initialize authoredSourceIndex : EnvExtension (Option SourceIndex) ←
+  registerEnvExtension (pure none) (asyncMode := .local)
+
+private def getAuthoredSourceIndex (source : String) : DocElabM SourceIndex := do
+  if let some index := authoredSourceIndex.getState (← getEnv) then
+    if index.text == source then return index
+  let index := SourceIndex.ofString source
+  modifyEnv fun env => authoredSourceIndex.setState env (some index)
+  return index
+
 private def codeOrigins (contents : StrLit) : DocElabM (Array LineOrigin) := do
   let some rawRange := contents.raw.getRange? | throwError "LSP code requires source positions"
   let fileMap ← getFileMap
   let uri := (System.Uri.pathToUri (← getFileName) : String)
   let raw := rawRange.start.extract fileMap.source rawRange.stop
-  let rawLines := raw.splitOn "\n" |>.toArray
-  let lines := contents.getString.splitOn "\n" |>.toArray
-  unless rawLines.size == lines.size do throwError "code source projection has different line counts"
-  let mut offset := rawRange.start.byteIdx
+  let text := contents.getString
+  let rawIndex := SourceIndex.ofString raw
+  let textIndex := SourceIndex.ofString text
+  let fileIndex ← getAuthoredSourceIndex fileMap.source
+  unless rawIndex.lineCount == textIndex.lineCount do
+    throwError "code source projection has different line counts"
   let mut origins := #[]
-  for index in [:lines.size] do
-    let rawLine := rawLines[index]!
-    let line := lines[index]!
-    unless rawLine.endsWith line do throwError "code text is not an exact authored line suffix"
-    let removedIndent := rawLine.dropEnd line.length |>.copy
+  for line in [:textIndex.lineCount] do
+    let some (rawStart, rawStop) := rawIndex.lineByteRange? line
+      | throwError "code projection has an invalid authored line"
+    let some (start, stop) := textIndex.lineByteRange? line
+      | throwError "code projection has an invalid text line"
+    let rawLine := String.Pos.Raw.extract raw ⟨rawStart⟩ ⟨rawStop⟩
+    let textLine := String.Pos.Raw.extract text ⟨start⟩ ⟨stop⟩
+    unless rawLine.endsWith textLine do throwError "code text is not an exact authored line suffix"
+    let removedIndent := rawLine.dropEnd textLine.length |>.copy
     unless removedIndent.all Char.isWhitespace do throwError "code projection removed non-whitespace source"
-    let position := fileMap.utf8PosToLspPos ⟨offset⟩
-    origins := origins.push {
-      uri, line := position.line, character := position.character + removedIndent.utf16Length }
-    offset := offset + rawLine.utf8ByteSize + 1
+    let offset := rawRange.start.byteIdx + rawStart + removedIndent.utf8ByteSize
+    let some position := fileIndex.position? offset | throwError "invalid authored code offset"
+    origins := origins.push { uri, line := position.line, character := position.character }
   return origins
 
 /-- Experimental syntax: compilation records intent and never starts a server. -/
@@ -167,13 +182,16 @@ def lspRef : RoleExpanderOf ReferenceConfig
   | config, contents => do
     unless contents.isEmpty do throwError "lspRef displays its written name; its body must be empty"
     let text := config.written.val
-    if text.isEmpty || text.contains '\n' then throwError "expected a nonempty single-line reference"
+    if text.isEmpty || (SourceIndex.ofString text).lineCount != 1 then
+      throwError "expected a nonempty single-line reference"
     let some range := config.written.syntax.getRange? | throwError "reference requires source positions"
     let fileMap ← getFileMap
     let raw := range.start.extract fileMap.source range.stop
     unless raw == "\"" ++ text ++ "\"" do
       throwError "escaped reference literals are not supported by this experimental source mapper"
-    let position := fileMap.utf8PosToLspPos (range.start + '"')
+    let sourceIndex ← getAuthoredSourceIndex fileMap.source
+    let some position := sourceIndex.position? (range.start.byteIdx + 1)
+      | throwError "invalid authored reference offset"
     let request : Request := {
       key := requestKey config.context config.key, context := config.context
       kind := .reference, text

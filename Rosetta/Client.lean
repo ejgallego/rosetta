@@ -396,20 +396,11 @@ def Client.openDocument (client : Client) (uri languageId text : String) : EIO C
     return version
   return { client, uri, version }
 
-/-- LSP counts CR, LF, and CRLF as line endings. -/
-private def documentEndPosition (text : String) : Lsp.Position := Id.run do
-  let mut line := 0
-  let mut character := 0
-  let mut afterCR := false
-  for c in text do
-    if c == '\r' || c == '\n' then
-      if c == '\r' || !afterCR then
-        line := line + 1
-      character := 0
-    else
-      character := character + c.utf16Size.toNat
-    afterCR := c == '\r'
-  return ⟨line, character⟩
+private def Document.snapshot (document : Document) : EIO ClientError OpenDocument :=
+  document.client.state.atomically do
+    let s ← get
+    admit s
+    checkedDocument s document.uri document.version
 
 /-- Full replacement for full sync, a whole-document range for incremental sync.
 The returned handle supersedes the old version atomically with queue admission. -/
@@ -419,18 +410,19 @@ def Document.change (document : Document) (text : String) : EIO ClientError Docu
   let sync := (caps.getObjVal? "textDocumentSync").toOption.getD .null
   let kind := (fromJson? (α := Nat) sync).toOption <|> (sync.getObjValAs? Nat "change").toOption
   unless kind == some 1 || kind == some 2 do throw <| ClientError.unsupported "document synchronization"
-  let deadline := (← IO.monoMsNow) + client.config.timeoutMs
+  let change ← if kind == some 1 then pure <| Json.mkObj [("text", toJson text)] else do
+    let doc ← document.snapshot
+    let range : Lsp.Range := { start := ⟨0, 0⟩, «end» := Internal.sourceEndPosition doc.text }
+    pure <| Json.mkObj [("range", toJson range), ("text", toJson text)]
   let version ← client.state.atomically do
     let s ← get
     admit s
     let doc ← checkedDocument s document.uri document.version
     let version := s.nextVersion
-    let change := if kind == some 1 then Json.mkObj [("text", toJson text)] else
-      let oldRange : Lsp.Range := { start := ⟨0, 0⟩, «end» := documentEndPosition doc.text }
-      Json.mkObj [("range", toJson oldRange), ("text", toJson text)]
     let payload := notification "textDocument/didChange" <| some <| Json.mkObj [
       ("textDocument", Json.mkObj [("uri", toJson document.uri), ("version", toJson version)]),
       ("contentChanges", toJson #[change])]
+    let deadline := (← IO.monoMsNow) + client.config.timeoutMs
     let s ← enqueue client.config s { payload, deadline }
     set { s with
       nextVersion := version + 1
@@ -449,12 +441,6 @@ def Document.close (document : Document) : EIO ClientError Unit := do
     checkDocument s (some (document.uri, document.version))
     let s ← enqueue client.config s { payload, deadline }
     set { s with documents := s.documents.erase document.uri }
-
-private def Document.snapshot (document : Document) : EIO ClientError OpenDocument :=
-  document.client.state.atomically do
-    let s ← get
-    admit s
-    checkedDocument s document.uri document.version
 
 /-- The exact text belonging to this admitted document version. -/
 def Document.text (document : Document) : EIO ClientError String := do

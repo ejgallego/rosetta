@@ -52,64 +52,75 @@ validation/matching (`Bundle.validate`, `Bundle.find`), and the Verso bridge
 retain their existing responsibilities. The current `VersoRosetta.collect` and
 `VersoRosetta.enrich` entry points operate on Manual parts and remain pure.
 
-## Workspace references and highlighted definitions
+## Workspace symbols and source excerpts
 
-`Client.workspaceSymbols query` wraps `workspace/symbol`, including deferred
-locations via `workspaceSymbol/resolve`. `Document.definitions position` wraps
-`textDocument/definition` and preserves both full and selection ranges from
-LocationLink. `Document.semanticTokens range?` requests and decodes semantic tokens
-against the exact opened document text. When a range is supplied and the server
-supports range tokens, it requests only that range; otherwise it requests full
-document tokens.
-Rosetta advertises both request forms and never sends an unadvertised full
-request to a range-only server. A `null` token result means no coloring; the
-source slice is still preserved. The handle supplies its admitted version's text; callers cannot supply a mismatching buffer.
-
-For a named reference, use:
+To display a named symbol, pass its name and optional container separately.
+The following call reads a Rust method after the server has indexed the project.
 
 ```lean
-Client.withSession config fun client => do
-  -- Wait for the project's server to finish loading, when necessary.
-  client.sourceDefinition "rust" "EdwardsPoint::compress" "::"
+client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")
 ```
 
-`Client.sourceDefinition` searches by the final component, filters fuzzy results
-to an exact name and optional container supplied by the author, and requires a
-unique location. It asks `definition` at that location, follows the returned
-file URI, and highlights its returned range. The result is a
-`HighlightedDefinition` with the original `DefinitionTarget`, language ID, and
-lossless text pieces carrying semantic token types and modifiers. Token spans
-intersecting the range boundaries are clipped, preserving Unicode and CRLF.
-An already-open document supplies its overlay and remains open. Otherwise the
-helper reads the file and scopes its temporary document. Non-file URIs without
-an open overlay are reported as unsupported. Borrowing requires the overlay's
-language ID to match the requested language. `withDocument` also requires
-identical text. Scoped callbacks must retain the admitted version until release.
-An edit or explicit close invalidates that version. `ClientError.documentCleanup`
-reports the release failure and retains any callback error.
+The result is a `SourceExcerpt` containing the indexed `location`, the requested
+`languageId`, and the text `pieces`. The server chooses the
+range. An index entry spanning `MyType measure();` yields that declaration.
+An entry spanning only `measure` yields only the name.
 
-The lower-level operations `Client.workspaceDefinition` and
-`Client.highlightDefinition` can be used separately. Missing or ambiguous names
-produce `ClientError.invalidInput`; protocol, server, and unsupported-feature
-errors keep their existing types. A Location-only server controls the source
-extent it returns; Rosetta does not invent a larger declaration range.
+Use `client.lookupSymbols "compress" (container? := some "EdwardsPoint")`
+for an array of distinct `Lsp.Location` values in server order. The array can
+be empty or contain several locations. Rosetta sends the name to `workspace/symbol`
+and filters candidates by exact name and optional server-reported
+`containerName`. It requests `workspaceSymbol/resolve` only for matching
+candidates with a deferred range. Duplicate hits at the same URI and range
+count as one location. Omitting the container searches across all containers.
+`client.lookupSymbol name container?` requires exactly one matching location.
+Both calls work on the index alone, including for an unopened non-file URI.
+For all search candidates, use `client.workspaceSymbols query`. Both search APIs
+reject reversed ranges and reject a resolve response that changes the candidate's
+name, kind, URI or previously supplied container.
 
-This is workspace symbol discovery, not compiler resolution of expressions or
-imports. Qualification matches the server's `containerName` exactly; supported
-container depth is determined by the server. For a Rust expression in a known
-scope, use `Document.definitions` or the existing `ContextProfile` analysis.
+For Go to Definition, call `document.definitions position` with the position
+of the reference you want to follow. In `MyType measure();`, asking at the
+start of the declaration can take you to the definition of `MyType`. Named
+lookup therefore uses only the indexed location. The direct definition request
+returns all targets from the server, including an empty array or several targets.
+
+Use `client.sourceExcerpt languageId location` to read any `Lsp.Location`.
+When the document is open, Rosetta borrows its current overlay and checks
+that the language matches. A workspace symbol range carries no document
+version, so an edit since indexing can change the text at that range. For an
+unopened local file URI without a query or fragment, Rosetta reads it from disk
+and opens a temporary document. Other URIs need an open overlay. A concurrent
+edit or close that invalidates a borrowed version is reported at scope release.
+
+Concatenating `pieces` reproduces the selected text, including Unicode and CR,
+LF or CRLF line endings. Oversized UTF-16 columns on existing lines select the
+end of those lines. Reversed ranges, missing lines and columns that split a
+surrogate pair are protocol errors. `SourceExcerpt.location` retains the supplied
+range. Rosetta requests range tokens using the clamped coordinates or uses full
+tokens when range tokens are unavailable. It clips tokens at the excerpt boundaries. Missing token
+support or a null token result yields plain text. A caller explicitly requesting
+tokens with `document.semanticTokens range?` receives `ClientError.unsupported`
+when the requested operation is unavailable.
+
+Exact lookup reports `ClientError.invalidInput` if the name or supplied
+container is empty. `lookupSymbol` and `symbolSource` also report it when the
+server returns zero or several distinct matching locations. Malformed replies,
+server errors, timeouts, disconnections and source-reading failures propagate.
 
 Initialization options remain caller-owned. For example, rust-analyzer needs
 `workspace.symbol.search.kind = "all_symbols"` to include methods. Workspace
-indexing readiness is also server-specific. Configure the methods whose latest
-params must survive unrelated traffic **before starting the session**:
+indexing readiness is also server-specific. For rust-analyzer, enable status
+notifications and retain the latest status before starting the session.
 
 ```lean
 Client.withSession { config with
-    retainedNotificationMethods := #["experimental/serverStatus"] } fun client => do
+    experimentalCapabilities := config.experimentalCapabilities.mergeObj
+      (Json.mkObj [("serverStatusNotification", toJson true)])
+    retainedNotificationMethods := config.retainedNotificationMethods.push "experimental/serverStatus" } fun client => do
   client.waitForNotification "experimental/serverStatus" (fun status =>
     (status.getObjValAs? Bool "quiescent").toOption == some true) 30000
-  client.sourceDefinition "rust" "EdwardsPoint::compress" "::"
+  client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")
 ```
 
 `Client.latestNotification method : BaseIO (Option Json)` returns the latest
@@ -131,8 +142,8 @@ server-specific predicate and experimental capabilities needed to enable it.
 
 `Client.notifications` independently retains the latest 512 general notifications
 with an eviction count. Diagnostics remain in `Document.diagnostics`, outside
-both general-notification stores. The generic API contains no Rust names, source
-paths, or Rust syntax assumptions; the author supplies the reference separator.
+both general-notification stores. The generic API accepts server-reported symbol
+names and containers without parsing language-specific syntax.
 
 ## Error contract
 
@@ -184,11 +195,10 @@ There are four distinct operations:
 - `lspCode` records authored source to analyze in a registered context.
 - `lspRef` queries an expression in that context's composed scope, using the
   profile's language-specific wrapper. It does not search a workspace index.
-- `workspaceSymbols` / `workspaceDefinition` discover a unique server-reported
-  name/container candidate and follow its definition.
-- `highlightDefinition` presents an existing source range, using an open overlay
-  when available. Its lossless `HighlightedPiece` view serves source excerpts;
-  `SemanticSpan` serves overlays on separately owned authored text.
+- `lookupSymbols` finds all distinct indexed locations for an exact symbol name
+  and optional container. `lookupSymbol` requires one location.
+- `sourceExcerpt` presents an existing source range, using an open overlay when
+  available. `symbolSource` combines lookup and excerpt in one call.
 
 `analyze` degrades explicit optional-feature server errors into `Outcome.failed`
 and unavailable capabilities into `Outcome.unsupported`. Transport, protocol,
@@ -197,15 +207,19 @@ version, cancellation, deadline, IO and cleanup failures abort with their typed
 
 `QuerySnapshot.definitions` preserves the ranges returned by the prover.
 For a definition in the composed document, `analyze` maps its selection range
-back to the request keys in `localTargets`. The projection recognizes LF and
-CRLF line endings. A UTF-16 column beyond the end of its line resolves to the
-end of that line for this lookup.
+back to the request keys in `localTargets`. Source projection and authored
+locations recognize CR, LF and CRLF line endings. A live diagnostic or
+definition selection that extends past the end of a line is clamped to that
+line. Diagnostics on generated text retain normalized coordinates in the
+composed document.
 
-Bundle revision 2 stores diagnostics only in request coordinates. Authored
-locations are derived by `Request.authoredLocations`, never duplicated in JSON.
+Bundle revision 2 stores each request's diagnostics in request coordinates.
+Use `Request.authoredLocations` to recover their locations in the authored file.
 Live semantic tokens and replay share `validateSemanticSpans`: ranges must be
 positive, single-line, ordered, non-overlapping and on valid UTF-16 boundaries.
-`SourceIndex` lets repeated conversions share a precomputed line index.
+Each `SourceRange` stores its immutable `SourceIndex`. To split a file into
+many pieces, construct that index once and pass it to each slice. A second
+version of the file gets its own index, even if the URI is the same.
 
 `ContextProfile.provenance : Json` is caller-owned evidence copied into the
 context observation. It can record project revision, server version and profile

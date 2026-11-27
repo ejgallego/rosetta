@@ -25,4 +25,27 @@ A named reference {lspRef "reference" "foreign" (context := "demo")}[] shares it
 
 #guard requestKey "a:b" "c" != requestKey "a" "b:c"
 
+run_cmd do
+  let source := r#"open Verso Verso.Doc Verso.Genre.Manual VersoRosetta
+
+#docs (Genre.Manual) mixedEndings "Mixed line endings" :=
+:::::::
+```lspCode "mixed" (context := "demo")
+"# ++ "alpha\r😀beta\n" ++ r#"```
+
+A named reference {lspRef "after" "alpha" (context := "demo")}[].
+:::::::
+
+#guard (collect mixedEndings.toPart).toOption.any fun requests =>
+  if let #[body, reference] := requests then
+    let first := body.origins[0]!.line
+    body.text == "alpha\r😀beta\n" &&
+      body.origins.map (·.line) == #[first, first + 1, first + 2] &&
+      reference.origins.map (·.line) == #[first + 4]
+  else false
+"#
+  let (_, messages) ← Lean.Elab.process source (← Lean.getEnv) (← Lean.getOptions)
+  if messages.hasErrors then
+    for message in messages.toList do Lean.logError message.data
+
 end VersoRosettaTests

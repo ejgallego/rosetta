@@ -112,14 +112,14 @@ def Bundle.find (bundle : Bundle) (request : Request) : Except String RequestSna
 /-- Map each involved text line independently, retaining deindentation gaps. -/
 def Request.authoredLocations (request : Request) (range : Lsp.Range) :
     Except String (Array AuthoredLocation) := do
-  let some _ := byteRange? request.text range | throw "invalid request-relative diagnostic range"
-  let lines := request.text.splitOn "\n" |>.toArray
+  let sourceIndex := SourceIndex.ofString request.text
+  let some _ := sourceIndex.byteRange? range | throw "invalid request-relative diagnostic range"
   let mut locations := #[]
   for line in [range.start.line:range.end.line + 1] do
     let some origin := request.origins[line]? | throw "request lacks an authored line origin"
     let start := if line == range.start.line then range.start.character else 0
-    let stop := if line == range.end.line then range.end.character else
-      ((lines[line]!).dropSuffix "\r").copy.utf16Length
+    let some length := sourceIndex.lineLength? line | throw "invalid request-relative diagnostic line"
+    let stop := if line == range.end.line then range.end.character else length
     if start < stop || range.start == range.end then
       locations := locations.push {
         uri := origin.uri
@@ -141,16 +141,18 @@ def Bundle.validate (bundle : Bundle) : Except String Unit := do
     if requestKeys.contains request.key then throw s!"duplicate snapshot: {request.key}"
     requestKeys := requestKeys.insert request.key
     unless contextKeys.contains request.context do throw s!"missing context: {request.context}"
-    unless request.origins.size == (request.text.splitOn "\n").length do
+    let sourceIndex := SourceIndex.ofString request.text
+    unless request.origins.size == sourceIndex.lineCount do
       throw s!"invalid authored line map: {request.key}"
     if let .ok tokens := snapshot.tokens then
-      validateSemanticSpans request.text tokens
+      sourceIndex.validateSemanticSpans tokens
     for query in snapshot.queries do
-      unless (byteRange? request.text query.range).isSome do throw "invalid saved query range"
+      unless (sourceIndex.byteRange? query.range).isSome do throw "invalid saved query range"
       for target in query.localTargets do
         unless bundle.requests.any (fun snapshot => snapshot.request.key == target &&
             snapshot.request.context == request.context) do throw "unknown local definition target"
     for diagnostic in snapshot.diagnostics do
-      discard <| request.authoredLocations diagnostic.range
+      unless (sourceIndex.byteRange? diagnostic.range).isSome do
+        throw "invalid request-relative diagnostic range"
 
 end Rosetta

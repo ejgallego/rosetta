@@ -59,11 +59,13 @@ rosetta`. For local development, replace the Git dependency with
 
 Then use `import Rosetta`. The main generator operation is
 `Rosetta.analyze : Array ContextProfile → Array Request → EIO ClientError Bundle`.
-For named workspace references, `client.sourceDefinition languageId reference separator`
-searches workspace symbols, follows the LSP definition result, and highlights
-the returned source range with semantic tokens. It requires a unique exact name
-and, when supplied, a matching server-reported container. It never chooses an
-arbitrary fuzzy result. Server initialization and readiness remain caller-owned.
+For a named symbol, `client.symbolSource "rust" "compress" (container? := some "EdwardsPoint")`
+returns the location from the workspace index and the text it selects.
+Use `client.lookupSymbols name container?` to handle zero or multiple exact
+matches. Some servers index just the name. To follow a reference at a known
+position, use `document.definitions position`. Semantic tokens add coloring
+when supported.
+The caller configures the server and waits for indexing as needed.
 Use `ClientConfig.retainedNotificationMethods` and `Client.latestNotification`
 when a loading-state update must survive eviction from the notification journal.
 
