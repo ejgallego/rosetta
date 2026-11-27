@@ -32,14 +32,60 @@ lake test
 
 `lake test` runs the deterministic protocol, source-mapping, deadline,
 cancellation, and cleanup tests. Tests need Python 3 for the stdio mock peer;
-the library does not. Real-server probes expect the supplied fixture structure;
-first copy `tests/lsp/projects/rust` and `tests/lsp/projects/rocq` to temporary
-directories, then run them explicitly:
+the library needs only Lean and Std. Opt-in acceptance against rust-analyzer and coq-lsp
+uses pinned executable checksums and fixture revisions in
+[`tests/real_provers/pins.json`](tests/real_provers/pins.json). It copies fixtures
+to temporary projects and tests the public analysis API with repeated requests,
+Unicode source, hover, definitions, semantic coloring, and valid and invalid
+overlays. It checks cancellation and reuse on the same connection, then verifies
+process cleanup.
+
+Run the probe with Rust 1.89.0 and coq-lsp 0.2.4 with Rocq 9.1.0 on Linux x86-64.
 
 ```sh
-lake exe rosetta-spike probe rust /path/to/rust-analyzer /path/to/copied-rust-fixture
-lake exe rosetta-spike probe rocq /path/to/coq-lsp /path/to/copied-rocq-fixture
+python3 scripts/check_real_provers.py \
+  --rust-analyzer "$(rustup which rust-analyzer)" \
+  --rustc "$(rustup which rustc)" --cargo "$(rustup which cargo)" \
+  --coq-lsp "$HOME/.opam/rocq-v9.1/bin/coq-lsp" \
+  --rocq "$HOME/.opam/rocq-v9.1/bin/rocq" \
+  --output /tmp/rosetta-real-provers-evidence
 ```
+
+Pass the executable paths reported by `rustup which`. The runner checks
+exact `--version` output and SHA-256 before launching a server. These hashes
+identify the binaries from the tested installation. The pinned Rocq runtime
+and standard library must accompany coq-lsp.
+The runner copies the files listed in the fixture manifest into temporary
+projects. Its evidence includes tool identity, analysis bundles, cleanup
+reports, and a transport trace with request and cancellation IDs.
+If a probe times out or the runner receives `SIGINT` or `SIGTERM`, the Linux
+runner terminates the probe and reaps its remaining descendants before removing
+the temporary projects. The output directory retains any evidence written by
+that point.
+
+The optional `RosettaProverProfiles` library supplies two profiles for an
+existing member of a project. Pass a `Rosetta.ProverProfiles.Config` with the
+client configuration, optional provenance, and a readiness timeout (60 seconds
+by default) to `rustProfile config key document` or `coqProfile config key document`.
+
+- The Rust profile enables native diagnostics and disables check-on-save, build
+  scripts, and proc macros. It records the process-wide status that satisfied
+  its quiescence check and pulls diagnostics for the admitted overlay. A
+  qualified reference such as `arithmetic::step` selects `step`. A caller can
+  set `ContextProfile.referenceQueryOffset` to choose the position in a more
+  complex expression.
+- The Rocq profile enables final diagnostic publications and disables eager
+  intermediate ones. It waits for diagnostics for the admitted document
+  version, including an empty set, then calls `coq/getDocument` for the
+  terminal result. This preserves both successful completion and failure when
+  Rocq reaches its error limit.
+
+Both profiles forward cancellation through their waits and requests.
+
+Consumers can share `verify_tools`, `copy_fixtures`, and the
+`tool_environment(evidence)` context manager from the Python runner. Keep the
+context manager open through all sessions so they can resolve the verified
+executables and use the explicit `RUSTC` path.
 
 The client uses stdio transport and UTF-16 LSP positions. Process-group cleanup
 is currently validated on Linux and uses the standard Unix `kill` utility for
@@ -76,7 +122,8 @@ See the [API guide](doc/API.md) for sessions, handles, error constructors, and
 conversion to an application's `IO` boundary.
 
 For Verso authoring and rendering, use the separate
-[VersoRosetta package](verso/README.md).
+[VersoRosetta package](verso/README.md). It includes a runnable
+[analysis and offline replay example](verso/README.md#a-complete-runnable-workflow).
 
 See [migration notes](doc/MIGRATION.md) for consumers of the earlier VBP
 snapshot or the lean-mirror vendored patch, and [contributing](CONTRIBUTING.md)

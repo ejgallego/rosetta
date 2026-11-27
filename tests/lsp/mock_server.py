@@ -111,12 +111,12 @@ class AnalysisPeer:
                 "hold-definition": "textDocument/definition"}
     identifier = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
 
-    def __init__(self, token_mode):
+    def __init__(self, token_mode, hold_first_diagnostic):
         self.token_mode = token_mode
         self.documents = {}
         self.document_events = []
         self.requests = []
-        self.held_diagnostics = False
+        self.hold_next_diagnostic = hold_first_diagnostic
 
     def tokens(self, text):
         data = []
@@ -136,11 +136,11 @@ class AnalysisPeer:
         self.requests.append({"method": method, "id": request_id, "uri": uri,
                               "position": params.get("position")})
         if method == "textDocument/diagnostic":
-            if self.held_diagnostics:
-                reply(request_id, {"kind": "full", "items": []})
-            else:
-                self.held_diagnostics = True
+            if self.hold_next_diagnostic:
+                self.hold_next_diagnostic = False
                 send({"method": "test/analysis-held", "params": {}})
+            else:
+                reply(request_id, {"kind": "full", "items": []})
             return
         if method == self.features.get(self.token_mode):
             send({"method": "test/analysis-held", "params": {}})
@@ -227,7 +227,7 @@ while True:
     if method == "initialize":
         options = params.get("initializationOptions") or {}
         if options.get("mode") == "analysis":
-            analysis_peer = AnalysisPeer(options.get("tokenMode"))
+            analysis_peer = AnalysisPeer(options.get("tokenMode"), options.get("holdFirstDiagnostic", False))
     if analysis_peer is not None and analysis_peer.handle(method, request_id, params):
         continue
     if method == "initialize":

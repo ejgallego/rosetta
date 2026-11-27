@@ -56,6 +56,13 @@ inductive ClientError where
   | documentCleanup (uri : String) (version : Int) (cause : ClientError) (original? : Option ClientError)
   | cleanup (report : CloseReport) (original? : Option ClientError)
 
+/-- Combine an action's result with its session close report, retaining both failures. -/
+def CloseReport.finish (report : CloseReport) (result : Except ClientError α) : Except ClientError α :=
+  if report.complete then result
+  else match result with
+    | .ok _ => .error (.cleanup report none)
+    | .error cause => .error (.cleanup report (some cause))
+
 partial def ClientError.toString : ClientError → String
     | .cancelled method => s!"request cancelled: {method}"
     | .deadline method => s!"request deadline exceeded: {method}"

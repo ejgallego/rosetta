@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "fixtureRevision": 1,
+  "platform": "linux-x86_64",
+  "tools": {
+    "rust-analyzer": {
+      "version": "rust-analyzer 1.89.0 (2948388 2025-08-04)",
+      "sha256": "baa454e60b0125c7f1e8444f4821c8a601cf292980ed2064c539f9781d2858c5"
+    },
+    "rustc": {
+      "version": "rustc 1.89.0 (29483883e 2025-08-04)",
+      "sha256": "c6ac0142c05a60b0f6c15e1a118bd5ac3bd04924cd6dc0c328f501c5f86e4142"
+    },
+    "cargo": {
+      "version": "cargo 1.89.0 (c24e10642 2025-06-23)",
+      "sha256": "5b32bd53b8a08d8e206daed51f3fce40cdc0729038ff96bd0ca845596a2c1019"
+    },
+    "coq-lsp": {
+      "version": "0.2.4",
+      "sha256": "c6c3092bd85188918c2ce0f520a66100d73b7ebbfe7d8af0f6d6adbdcefee16a"
+    },
+    "rocq": {
+      "version": "The Rocq Prover, version 9.1.0\ncompiled with OCaml 4.14.2",
+      "sha256": "ff7ccb431ba3978c3bc0930524966824d93a5fd4af98b0292069a104a2ba9739"
+    }
+  },
+  "fixtures": {
+    "rocq/Probe.v": "4e09eb0e03fb111aa0cb91573ca04ac68b5c5e241a1dc58d2b65d0fc806ff350",
+    "rocq/_CoqProject": "acf71fac377554e3b5f64c68e778c12941541fef0ed3266c0c27e6d07315eb6a",
+    "rust/Cargo.toml": "55fb0617e04e1a1f994407a640dd493926d77532e9e3230a4af0beaa0b5923dd",
+    "rust/src/lib.rs": "7806796dc89909a54aa1ba0ae082b061dc756327d01e9181e421a7da495271d0"
+  }
+}

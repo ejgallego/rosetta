@@ -89,12 +89,12 @@ def Document.semanticTokens (document : Document) (range? : Option Lsp.Range := 
     | none => semanticSpans text provider result
   EIO.ofExcept <| spans.mapError ClientError.protocol
 
-/-- Await retained notification params satisfying a readiness predicate. Configure
+/-- Return retained notification params satisfying a readiness predicate. Configure
 the method in retainedNotificationMethods before startup. The caller owns
 server-specific readiness semantics; waiting is bounded. -/
 def Client.waitForNotification (client : Client) (method : String) (accept : Json → Bool)
     (timeoutMs : Nat := 30000) (cancel? : Option Std.CancellationToken := none) :
-    EIO ClientError Unit := do
+    EIO ClientError Json := do
   unless client.config.retainedNotificationMethods.contains method do
     throw <| ClientError.invalidInput s!"notification method was not configured for retention: {method}"
   let deadline := (← IO.monoMsNow) + timeoutMs
@@ -102,9 +102,10 @@ def Client.waitForNotification (client : Client) (method : String) (accept : Jso
     if let some token := cancel? then
       if ← token.isCancelled then throw <| ClientError.cancelled method
     if let some params ← client.latestNotification method then
-      if accept params then return
+      if accept params then return params
     if (← IO.monoMsNow) ≥ deadline then throw <| ClientError.deadline method
     IO.sleep 20
+  throw <| ClientError.protocol "unreachable notification wait"
 
 private def readSource (uri : String) : EIO ClientError String := do
   let some file := localFileUriPath? uri

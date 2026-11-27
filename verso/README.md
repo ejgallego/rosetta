@@ -12,8 +12,39 @@ lake build
 lake test
 ```
 
-The test compiles foreign code/reference authoring and checks plan collection
-without starting a language server or importing Blueprint.
+The tests compile foreign code/reference authoring and run the workflow CLI
+against the repository's deterministic Python mock. They compare the live and
+saved-bundle HTML output byte for byte with `PATH` pointing to an empty directory
+during replay. They also check source origins, repeated IDs, definition links to
+the first code panel in both output modes, Unicode text and escaped hover content.
+The tests and mock example require Python 3.
+
+## A complete runnable workflow
+
+From this directory, run:
+
+```sh
+lake exe rosetta-workflow analyze ../tests/lsp/mock_server.py _out/workflow
+lake exe rosetta-workflow replay _out/workflow/analysis.json _out/replayed
+```
+
+The first command collects the authored requests, configures a temporary mock
+project, runs analysis, and saves `analysis.json` alongside `html-single/` and
+`html-multi/`. The second command reads that bundle and renders the same compiled
+document without starting a server. Serve either HTML directory over HTTP to
+inspect its hover popups.
+
+[RosettaWorkflow.lean](examples/RosettaWorkflow.lean) contains the authoring,
+profile and generation stages. [WorkflowMain.lean](examples/WorkflowMain.lean)
+handles the command line. Repeated inclusions share analysis while receiving
+separate HTML IDs. The example waits for the mock's pull-diagnostic response.
+For a real prover, supply its executable, project file, reference wrapper and
+diagnostic readiness policy in `ContextProfile`.
+
+Bundles match exact compiled requests, including their authored origins. Moving
+or editing the example source can require a new analysis. The optional
+`AnalysisOptions` controls query budgets, request deadlines and cancellation.
+`analyzeWithClient` reuses a caller-owned initialized server for one profile.
 
 To pin the bridge from a Lean Lake configuration:
 
